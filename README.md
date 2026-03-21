@@ -40,7 +40,7 @@ pip install PySide6 msgpack
 ## Usage
 
 ```bash
-python Cellebrite-FFS-Browser.py
+python ios-ffs-browser.py
 ```
 
 ---
