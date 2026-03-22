@@ -32,7 +32,11 @@ _HEX_BYTES_PER_ROW = 32
 _HEX_ASCII_START  = _HEX_OFFSET_COLS + _HEX_GROUPS * _HEX_GROUP_STRIDE - 2 + 2
 # = 10 + 8*13 - 2 + 2 = 114  (subtract trailing sep that doesn't exist, add "  " before ASCII)
 
-
+def resource_path(relative):
+    """Works both in development and when bundled by PyInstaller."""
+    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative)
+  
 def _hex_col_to_byte(col: int) -> int | None:
     """Map a column index within a hex line to its byte index (0-31), or None."""
     if col < _HEX_OFFSET_COLS:
@@ -1209,11 +1213,11 @@ class FastZipBrowser(QMainWindow):
         self.save_settings()
 
     def save_settings(self):
-        with open(SETTINGS_FILE, 'w') as f:
+        with open(resource_path(SETTINGS_FILE), 'w') as f:
             json.dump(list(self.hidden_paths), f)
 
     def load_settings(self):
-        return set(_load_json_file(SETTINGS_FILE, []))
+        return set(_load_json_file(resource_path(SETTINGS_FILE), []))
 
     def load_recent_list(self):
         return _load_json_file(RECENT_FILE, [])
