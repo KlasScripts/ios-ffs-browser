@@ -2,6 +2,8 @@ name: Build Windows EXE
 
 on:
   push:
+  branches:
+    - main
     tags:
       - 'v*'          # triggers on v0.1.0, v1.0.0, etc.
 
