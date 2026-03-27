@@ -8,6 +8,7 @@ import json
 import subprocess
 import plistlib
 import pathlib
+from adapters import graykey as graykey_adapter
 from datetime import datetime, timezone
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView, QVBoxLayout,
                               QHBoxLayout, QWidget, QHeaderView, QPushButton,
@@ -179,7 +180,8 @@ def _get_file_type(name, is_folder):
     return 'Other'
 
 
-def _ui_path_to_physical(ui_path):
+def _cellebrite_path(ui_path: str) -> str:
+    """Resolve a ui_path to its physical location inside a Cellebrite zip."""
     parts = []
     for part in ui_path.split('/'):
         if '-' in part:
@@ -189,6 +191,11 @@ def _ui_path_to_physical(ui_path):
                 continue
         parts.append(part)
     return f"filesystem2/{'/'.join(parts)}"
+
+
+def _graykey_path(ui_path: str) -> str:
+    """Resolve a ui_path to its physical location inside a Graykey zip."""
+    return '/private/var/' + ui_path
 
 
 def _load_json_file(path, default):
@@ -211,12 +218,13 @@ class ExtractorWorker(QThread):
     status     = Signal(str)
     finished   = Signal(bool, str, str)
 
-    def __init__(self, zip_path, export_tasks, dest_dir, folder_map):
+    def __init__(self, zip_path, export_tasks, dest_dir, folder_map, path_resolver):
         super().__init__()
         self.zip_path = zip_path
         self.export_tasks = export_tasks
         self.dest_dir = dest_dir
         self.folder_map = folder_map
+        self.path_resolver = path_resolver
         self._cancelled = False
 
     def cancel(self):
@@ -248,7 +256,7 @@ class ExtractorWorker(QThread):
                 # Pre-fetch ZipInfo for every file (one central-directory lookup each)
                 zip_infos = {}
                 for ui_path, _ in final_queue:
-                    phys = _ui_path_to_physical(ui_path)
+                    phys = self.path_resolver(ui_path)
                     try:
                         zip_infos[phys] = z.getinfo(phys)
                     except KeyError:
@@ -265,7 +273,7 @@ class ExtractorWorker(QThread):
                         self.finished.emit(False, "Export cancelled.", "")
                         return
 
-                    physical_path = _ui_path_to_physical(ui_path)
+                    physical_path = self.path_resolver(ui_path)
                     path_segments = list(os.path.split(rel_path))
                     if path_segments[1].startswith('.'):
                         path_segments[1] = '_' + path_segments[1][1:]
@@ -327,7 +335,7 @@ class ExtractorWorker(QThread):
 
 class ZipMetadataWorker(QThread):
     status_update = Signal(str)
-    metadata_ready = Signal(dict, dict, dict, object)
+    metadata_ready = Signal(dict, dict, dict, object, object)
 
     def __init__(self, zip_path):
         super().__init__()
@@ -349,13 +357,27 @@ class ZipMetadataWorker(QThread):
                         with z.open(mp) as f:
                             plist = plistlib.loads(f.read())
                             bid = plist.get("MCMMetadataIdentifier")
-                            if bid: guid_to_bundle[guid] = bid
+                            if bid:
+                                guid_to_bundle[guid] = bid
                     except (KeyError, OSError, plistlib.InvalidFileException):
                         continue
 
-                self.status_update.emit("Reading metadata.msgpack...")
-                with z.open('metadata2/metadata.msgpack') as f:
-                    raw_data = msgpack.unpack(f)
+                if graykey_adapter._is_graykey(z):
+                    self.status_update.emit("Graykey archive detected — extracting metadata...")
+                    raw_data = graykey_adapter.extract_metadata(self.zip_path)
+                    # Strip '/private/var/' prefix so ui_paths match Cellebrite paths
+                    # (e.g. '/private/var/mobile/...' → 'mobile/...')
+                    _GK_PREFIX = '/private/var/'
+                    raw_data = {
+                        k[len(_GK_PREFIX):] if k.startswith(_GK_PREFIX) else k.lstrip('/'): v
+                        for k, v in raw_data.items()
+                    }
+                    path_resolver = _graykey_path
+                else:
+                    self.status_update.emit("Reading metadata.msgpack...")
+                    with z.open('metadata2/metadata.msgpack') as f:
+                        raw_data = msgpack.unpack(f)
+                    path_resolver = _cellebrite_path
 
             self.status_update.emit("Generating tree...")
             ui_metadata = {}
@@ -364,11 +386,23 @@ class ZipMetadataWorker(QThread):
             for ui_path, meta in raw_data.items():
                 ui_metadata[ui_path] = meta
                 parent_path = ui_path.rsplit('/', 1)[0] if '/' in ui_path else ""
-                if parent_path not in folder_map:
-                    folder_map[parent_path] = []
-                folder_map[parent_path].append(ui_path)
+                folder_map.setdefault(parent_path, []).append(ui_path)
 
-            self.metadata_ready.emit(ui_metadata, folder_map, guid_to_bundle, zip_names)
+            # Reconnect orphaned directories whose intermediate parents have no
+            # explicit zip entry (common in Graykey archives)
+            for path in list(folder_map.keys()):
+                current = path
+                while current:
+                    parent = current.rsplit('/', 1)[0] if '/' in current else ""
+                    if parent not in folder_map:
+                        folder_map[parent] = [current]
+                    elif current not in folder_map[parent]:
+                        folder_map[parent].append(current)
+                    else:
+                        break
+                    current = parent
+
+            self.metadata_ready.emit(ui_metadata, folder_map, guid_to_bundle, zip_names, path_resolver)
         except Exception as e:
             self.status_update.emit(f"Error: {str(e)}")
 
@@ -551,6 +585,7 @@ class FastZipBrowser(QMainWindow):
         self._real_content_cache: dict = {}
         self._zip_handle: zipfile.ZipFile | None = None
         self._hex_worker: QThread | None = None
+        self._path_resolver = _cellebrite_path
         self.hidden_paths = self.load_settings()
         self.recent_paths = self.load_recent_list()
         self._view_path = ""
@@ -739,11 +774,11 @@ class FastZipBrowser(QMainWindow):
             self._log(f"Filter cleared in: {self._view_path}")
 
     def _in_zip(self, ui_path) -> bool:
-        return _ui_path_to_physical(ui_path) in self.zip_names
+        return self._path_resolver(ui_path) in self.zip_names
 
     def _is_empty_folder_entry(self, ui_path) -> bool:
         """True when the ZIP contains a bare directory entry for this path (trailing slash)."""
-        return (_ui_path_to_physical(ui_path) + "/") in self.zip_names
+        return (self._path_resolver(ui_path) + "/") in self.zip_names
 
     def _folder_content_status(self, folder_path) -> str:
         """Classify a folder recursively as 'content', 'metadata_only', or 'empty'.
@@ -882,7 +917,7 @@ class FastZipBrowser(QMainWindow):
         self._hex_bytes_loaded = 0
         self._hex_ui_path = ui_path
 
-        physical_path = _ui_path_to_physical(ui_path)
+        physical_path = self._path_resolver(ui_path)
         total_size = self.full_metadata.get(ui_path, {}).get('size', 0)
 
         self.hex_view.clear()
@@ -1385,7 +1420,7 @@ class FastZipBrowser(QMainWindow):
         dest_dir = self._get_export_dir()
         dlg = ExportProgressDialog(dest_dir, parent=self)
 
-        self.ex_worker = ExtractorWorker(self.zip_path, tasks, dest_dir, self.folder_map)
+        self.ex_worker = ExtractorWorker(self.zip_path, tasks, dest_dir, self.folder_map, self._path_resolver)
         self.ex_worker.file_count.connect(dlg.on_file_count)
         self.ex_worker.progress.connect(dlg.on_progress)
         self.ex_worker.status.connect(dlg.on_status)
@@ -1458,11 +1493,12 @@ class FastZipBrowser(QMainWindow):
         self.worker.metadata_ready.connect(self.on_metadata_ready)
         self.worker.start()
 
-    def on_metadata_ready(self, data, folder_map, guid_map, zip_names):
+    def on_metadata_ready(self, data, folder_map, guid_map, zip_names, path_resolver):
         self.full_metadata = data
         self.folder_map = folder_map
         self.guid_to_bundle = guid_map
         self.zip_names = zip_names
+        self._path_resolver = path_resolver
         self._real_content_cache = {}
         if self._zip_handle:
             self._zip_handle.close()
