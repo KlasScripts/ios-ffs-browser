@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+
+#!/usr/bin/env python3
+# Based on gkls.py by slo-sleuth
+# https://github.com/slo-sleuth/gkls/blob/master/gkls.py
+# Original work Copyright (c) [year] slo-sleuth, MIT Licence
+
 """
 graykey.py — extract metadata from a Graykey full_files zip into a
 Cellebrite-compatible structure, optionally saved as msgpack.
