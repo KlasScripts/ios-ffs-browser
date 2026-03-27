@@ -7,10 +7,11 @@ import msgpack
 import json
 import subprocess
 import plistlib
+import pathlib
 from datetime import datetime, timezone
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView, QVBoxLayout,
                               QHBoxLayout, QWidget, QHeaderView, QPushButton,
-                              QFileDialog, QProgressBar, QMenu, QMessageBox, QDialog,
+                              QFileDialog, QProgressBar, QMenu, QDialog,
                               QRadioButton, QButtonGroup, QComboBox, QSplitter, QStatusBar,
                               QGroupBox, QLineEdit, QLabel, QPlainTextEdit, QFrame, QTextEdit)
 from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QFont,
@@ -36,6 +37,8 @@ _HEX_ASCII_START  = _HEX_OFFSET_COLS + _HEX_GROUPS * _HEX_GROUP_STRIDE - 2 + 2
 
 INITIAL_HEX_BYTES = 16384   # bytes shown immediately on open
 HEX_PAGE_BYTES    = 32768   # bytes loaded per scroll page
+MAX_HEX_HIGHLIGHT_BYTES = 512   # cap on simultaneous byte highlights
+FRAME_BUDGET_SECS = 0.016   # ~16 ms per batch (one frame budget)
 
 # Precomputed table: maps each byte value to its printable ASCII char or '.'
 _ASCII_XLAT = bytes(b if 32 <= b < 127 else ord('.') for b in range(256))
@@ -190,9 +193,9 @@ def _ui_path_to_physical(ui_path):
 
 def _load_json_file(path, default):
     try:
-        with open(path, 'r') as f:
+        with open(path, 'r', encoding='utf-8') as f:
             return json.load(f)
-    except:
+    except (OSError, json.JSONDecodeError):
         return default
 
 
@@ -347,7 +350,8 @@ class ZipMetadataWorker(QThread):
                             plist = plistlib.loads(f.read())
                             bid = plist.get("MCMMetadataIdentifier")
                             if bid: guid_to_bundle[guid] = bid
-                    except: continue
+                    except (KeyError, OSError, plistlib.InvalidFileException):
+                        continue
 
                 self.status_update.emit("Reading metadata.msgpack...")
                 with z.open('metadata2/metadata.msgpack') as f:
@@ -546,6 +550,7 @@ class FastZipBrowser(QMainWindow):
         self.zip_names: frozenset = frozenset()
         self._real_content_cache: dict = {}
         self._zip_handle: zipfile.ZipFile | None = None
+        self._hex_worker: QThread | None = None
         self.hidden_paths = self.load_settings()
         self.recent_paths = self.load_recent_list()
         self._view_path = ""
@@ -604,7 +609,7 @@ class FastZipBrowser(QMainWindow):
         self.tree_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree_view.customContextMenuRequested.connect(self.show_tree_context_menu)
         self.tree_view.clicked.connect(self.on_folder_selected)
-        self.tree_view.setToolTip("Right-click a folder to export or view all files recursively")
+        self.tree_view.setToolTip("Right-click a folder to export")
         self.splitter.addWidget(self.tree_view)
 
         self.file_model = QStandardItemModel()
@@ -797,15 +802,18 @@ class FastZipBrowser(QMainWindow):
             self.filter_col_combo.addItem(h)
         self.filter_col_combo.blockSignals(False)
 
+    def _zip_stem(self):
+        """Return (parent_dir, stem) for the currently loaded archive."""
+        p = pathlib.Path(self.zip_path)
+        return p.parent, p.stem
+
     def _get_export_dir(self):
-        zip_dir = os.path.dirname(self.zip_path)
-        zip_name = os.path.splitext(os.path.basename(self.zip_path))[0]
-        return os.path.join(zip_dir, f"{zip_name}_Export")
+        parent, stem = self._zip_stem()
+        return str(parent / f"{stem}_Export")
 
     def _get_log_path(self):
-        zip_dir = os.path.dirname(self.zip_path)
-        zip_name = os.path.splitext(os.path.basename(self.zip_path))[0]
-        return os.path.join(zip_dir, f"{zip_name}_audit_log.txt")
+        parent, stem = self._zip_stem()
+        return str(parent / f"{stem}_audit_log.txt")
 
     def _log(self, message):
         if not self.zip_path:
@@ -865,7 +873,7 @@ class FastZipBrowser(QMainWindow):
         self._log(f"{'Folder' if is_folder else 'File'} selected: {ui_path}")
 
     def _load_hex_preview(self, ui_path):
-        if hasattr(self, '_hex_worker') and self._hex_worker.isRunning():
+        if self._hex_worker is not None and self._hex_worker.isRunning():
             self._hex_worker.terminate()
             self._hex_worker.wait()
 
@@ -1015,14 +1023,16 @@ class FastZipBrowser(QMainWindow):
             self._fit_hex_font()
         return super().eventFilter(obj, event)
 
+    _HEX_PADDING_PX = 16  # stylesheet "padding: 4px 8px" → 8px left + 8px right
+
     def _fit_hex_font(self):
         if self._fitting_hex_font:
             return
-        vp_width = self.hex_view.viewport().width()
+        vp_width = self.hex_view.viewport().width() - self._HEX_PADDING_PX
         if vp_width <= 0:
             return
         font = self.hex_view.font()
-        char_w = QFontMetricsF(font).maxWidth()
+        char_w = QFontMetricsF(font).horizontalAdvance('W')
         if char_w <= 0:
             return
         line_chars = _HEX_ASCII_START + _HEX_BYTES_PER_ROW  # 146
@@ -1073,7 +1083,7 @@ class FastZipBrowser(QMainWindow):
                     selected.add(b)
 
             total_bytes += len(selected)
-            if total_bytes > 512:
+            if total_bytes > MAX_HEX_HIGHLIGHT_BYTES:
                 break
 
             for b in selected:
@@ -1100,7 +1110,7 @@ class FastZipBrowser(QMainWindow):
         item = self.tree_model.itemFromIndex(index)
         if not item: return
         folder_path = item.data(Qt.ItemDataRole.UserRole)
-        self.status_bar.showMessage(f"{folder_path}    |    Tip: Right-click to export or view all files recursively")
+        self.status_bar.showMessage(f"{folder_path}    |    Tip: Right-click to export")
         self._log(f"Folder viewed: {folder_path}")
 
         # In checkbox-driven modes, only block the click if checkboxes are actually driving the view
@@ -1191,7 +1201,7 @@ class FastZipBrowser(QMainWindow):
             if ts > 1e10:
                 ts = ts / 1e9
             return datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-        except:
+        except (ValueError, OSError, OverflowError):
             return str(ts)
 
     def ensure_and_open_export_dir(self):
@@ -1213,119 +1223,9 @@ class FastZipBrowser(QMainWindow):
         menu.addAction(export_act)
         menu.exec(self.tree_view.viewport().mapToGlobal(point))
 
-    def show_recursive_files(self, folder_path):
-        display_path = folder_path if folder_path else "/ [Full Filesystem]"
-        mode = self.view_group.checkedId()
-
-        # Count files first for the large-file warning
-        all_desc = []
-        self._collect_descendants(folder_path, all_desc)
-        file_count = sum(1 for p in all_desc if p not in self.folder_map)
-
-        if file_count > 10_000:
-            answer = QMessageBox.question(
-                self, "Large Recursive View",
-                f"This folder contains approximately {file_count:,} files.\n\n"
-                "Loading this many rows may take a while and use significant memory.\n\n"
-                "Do you want to continue?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-
-        if mode in (0, CLEAN_MODE):
-            # Tick this folder and all its subfolders, then rebuild once
-            root_item = self._find_tree_item(folder_path)
-            if root_item is None:
-                return
-            self.tree_model.blockSignals(True)
-            if root_item.isCheckable():
-                root_item.setCheckState(Qt.CheckState.Checked)
-            self._walk_item_check(root_item)
-            self.tree_model.blockSignals(False)
-            self._view_path = display_path
-            self._view_is_recursive = True
-            self._log(f"Recursive view: {display_path} ({file_count} files)")
-            self._rebuild_file_view_from_checked()
-        else:
-            # EDIT_FILTER_MODE: direct file loading (existing behaviour)
-            files = [p for p in all_desc if p not in self.folder_map]
-            self._update_filter_columns(self.file_headers)
-            self.filter_input.clear()
-            self._view_path = display_path
-            self._view_is_recursive = True
-            self._log(f"Recursive view: {display_path} ({len(files)} files)")
-            total = len(files)
-            self.progress_bar.setRange(0, total)
-            self.progress_bar.setValue(0)
-            self.progress_bar.show()
-            self.status_bar.showMessage(f"Loading {total:,} files recursively from: {display_path}")
-            new_model = QStandardItemModel()
-            new_model.setHorizontalHeaderLabels(self.file_headers)
-            for i, path in enumerate(sorted(files)):
-                name = path.split('/')[-1]
-                meta = self.full_metadata.get(path, {})
-                name_item = QStandardItem(name)
-                name_item.setData(path, Qt.ItemDataRole.UserRole)
-                name_item.setEditable(False)
-                if self._in_zip(path):
-                    file_type = _get_file_type(name, False)
-                    grey_row = False
-                elif self._is_empty_folder_entry(path):
-                    file_type = "Empty Folder"
-                    grey_row = True
-                else:
-                    file_type = "Not in Zip"
-                    grey_row = True
-                row_items = [name_item,
-                             _make_item(self.format_ts(meta.get('ctime'))),
-                             _make_item(self.format_ts(meta.get('mtime'))),
-                             _make_item(file_type),
-                             _make_item(f"{meta.get('size', 0):,}"),
-                             _make_item(path)]
-                if grey_row:
-                    grey = QColor(Qt.GlobalColor.darkGray)
-                    for item in row_items:
-                        item.setForeground(grey)
-                new_model.appendRow(row_items)
-                if i % 500 == 0:
-                    self.progress_bar.setValue(i)
-                    QApplication.processEvents()
-            self.file_model = new_model
-            self.proxy_model.setSourceModel(self.file_model)
-            self.progress_bar.hide()
-            self.file_view.resizeColumnsToContents()
-            self._refresh_table_status()
-            self.status_bar.showMessage(f"Done — {total:,} files loaded from: {display_path}")
-
     # ------------------------------------------------------------------ #
     #  Checkbox-driven file-view helpers (All Folders / Simplified modes) #
     # ------------------------------------------------------------------ #
-
-    def _find_tree_item(self, path: str, parent=None):
-        """Walk the tree model and return the item whose UserRole data matches path."""
-        if parent is None:
-            parent = self.tree_model.invisibleRootItem()
-        for row in range(parent.rowCount()):
-            item = parent.child(row)
-            if item is None:
-                continue
-            if item.data(Qt.ItemDataRole.UserRole) == path:
-                return item
-            found = self._find_tree_item(path, item)
-            if found:
-                return found
-        return None
-
-    def _walk_item_check(self, parent_item):
-        """Recursively check all checkable items under parent_item."""
-        for row in range(parent_item.rowCount()):
-            item = parent_item.child(row)
-            if item is None:
-                continue
-            if item.isCheckable():
-                item.setCheckState(Qt.CheckState.Checked)
-            self._walk_item_check(item)
 
     def _cascade_check(self, parent_item, state):
         """Propagate check state to all descendants of parent_item."""
@@ -1385,7 +1285,7 @@ class FastZipBrowser(QMainWindow):
                 return  # superseded by a newer rebuild — stop silently
 
             # Process as many folders as fit within ~16 ms (one frame budget)
-            deadline = time.monotonic() + 0.016
+            deadline = time.monotonic() + FRAME_BUDGET_SECS
 
             while state['idx'] < total_folders:
                 folder = folders[state['idx']]
@@ -1436,17 +1336,6 @@ class FastZipBrowser(QMainWindow):
                     f"{state['count']:,} files from {total_folders:,} selected folders")
 
         QTimer.singleShot(0, _process_batch)
-
-    def _collect_descendants(self, path, result, visited=None):
-        if visited is None:
-            visited = set()
-        if path in visited:
-            return
-        visited.add(path)
-        for child in self.folder_map.get(path, []):
-            result.append(child)
-            if child in self.folder_map:
-                self._collect_descendants(child, result, visited)
 
     def show_table_context_menu(self, point):
         index = self.file_view.indexAt(point)
@@ -1665,7 +1554,7 @@ class FastZipBrowser(QMainWindow):
         self._rebuild_file_view_from_checked()
 
     def save_settings(self):
-        with open(resource_path(SETTINGS_FILE), 'w') as f:
+        with open(resource_path(SETTINGS_FILE), 'w', encoding='utf-8') as f:
             json.dump(list(self.hidden_paths), f)
 
     def load_settings(self):
@@ -1678,7 +1567,8 @@ class FastZipBrowser(QMainWindow):
         if path in self.recent_paths: self.recent_paths.remove(path)
         self.recent_paths.insert(0, path)
         self.recent_paths = self.recent_paths[:5]
-        with open(RECENT_FILE, 'w') as f: json.dump(self.recent_paths, f)
+        with open(RECENT_FILE, 'w', encoding='utf-8') as f:
+            json.dump(self.recent_paths, f)
         self.update_dropdown_ui()
 
     def update_dropdown_ui(self):
