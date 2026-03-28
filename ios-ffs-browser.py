@@ -621,6 +621,9 @@ class FastZipBrowser(QMainWindow):
         self.jump_btn = QPushButton("Jump to ▾")
         self.jump_btn.clicked.connect(self._show_jump_menu)
         top_controls.addWidget(self.jump_btn)
+        self.collapse_btn = QPushButton("Collapse Tree")
+        self.collapse_btn.clicked.connect(self._collapse_tree)
+        top_controls.addWidget(self.collapse_btn)
         layout.addLayout(top_controls)
 
         top_bar = QHBoxLayout()
@@ -886,7 +889,8 @@ class FastZipBrowser(QMainWindow):
             found = False
             for row in range(current.rowCount()):
                 child = current.child(row)
-                if child.text() == part:
+                child_path = child.data(Qt.ItemDataRole.UserRole)
+                if child_path is not None and child_path.split('/')[-1] == part:
                     self.tree_view.expand(self.tree_model.indexFromItem(child))
                     current = child
                     found = True
@@ -1159,7 +1163,7 @@ class FastZipBrowser(QMainWindow):
         has_bundles = any(p.split('/')[-1] in self.guid_to_bundle for p in children)
 
         if has_bundles:
-            headers = [self.file_headers[0], 'Bundle ID'] + self.file_headers[1:]
+            headers = self.file_headers + ['UUID']
         else:
             headers = self.file_headers
 
@@ -1199,22 +1203,20 @@ class FastZipBrowser(QMainWindow):
                 file_type = "Not in Zip"
                 grey_row = True
 
-            name_item = QStandardItem(name)
+            name_item = QStandardItem(self._display_name(name))
             name_item.setData(path, Qt.ItemDataRole.UserRole)
             name_item.setEditable(False)
 
-            row_items = [name_item]
-
-            if has_bundles:
-                row_items.append(_make_item(self.guid_to_bundle.get(name, "")))
-
-            row_items.extend([
+            row_items = [name_item,
                 _make_item(self.format_ts(meta.get('ctime'))),
                 _make_item(self.format_ts(meta.get('mtime'))),
                 _make_item(file_type),
                 _make_item(f"{meta.get('size', 0):,}"),
-                _make_item(path),
-            ])
+                _make_item(self._display_path(path)),
+            ]
+
+            if has_bundles:
+                row_items.append(_make_item(name if name in self.guid_to_bundle else ""))
 
             if is_folder and not grey_row:
                 for item in row_items:
@@ -1231,6 +1233,14 @@ class FastZipBrowser(QMainWindow):
 
         self.file_view.resizeColumnsToContents()
         self._refresh_table_status()
+
+    def _display_name(self, segment: str) -> str:
+        """Return the bundle ID for a GUID segment, otherwise the segment itself."""
+        return self.guid_to_bundle.get(segment, segment)
+
+    def _display_path(self, path: str) -> str:
+        """Replace GUID segments in a full path with bundle IDs for display."""
+        return '/'.join(self._display_name(seg) for seg in path.split('/'))
 
     def format_ts(self, ts):
         if not ts: return ""
@@ -1333,7 +1343,7 @@ class FastZipBrowser(QMainWindow):
                         continue  # skip sub-folder entries
                     name = child.split('/')[-1]
                     meta = self.full_metadata.get(child, {})
-                    name_item = QStandardItem(name)
+                    name_item = QStandardItem(self._display_name(name))
                     name_item.setData(child, Qt.ItemDataRole.UserRole)
                     name_item.setEditable(False)
                     if self._in_zip(child):
@@ -1350,7 +1360,7 @@ class FastZipBrowser(QMainWindow):
                                  _make_item(self.format_ts(meta.get('mtime'))),
                                  _make_item(file_type),
                                  _make_item(f"{meta.get('size', 0):,}"),
-                                 _make_item(child)]
+                                 _make_item(self._display_path(child))]
                     if grey_row:
                         grey = QColor(Qt.GlobalColor.darkGray)
                         for it in row_items:
@@ -1446,6 +1456,13 @@ class FastZipBrowser(QMainWindow):
         elif sys.platform == 'darwin': subprocess.Popen(['open', path])
         else: subprocess.Popen(['xdg-open', path])
 
+    def _collapse_tree(self):
+        self.tree_view.collapseAll()
+        # Keep the root node expanded so the top-level folders are visible
+        root = self.tree_model.item(0)
+        if root:
+            self.tree_view.expand(self.tree_model.indexFromItem(root))
+
     def _show_jump_menu(self):
         menu = QMenu(self)
         self._build_jump_menu(menu, FORENSIC_SHORTCUTS)
@@ -1535,7 +1552,7 @@ class FastZipBrowser(QMainWindow):
             if p in self.folder_map:
                 if mode == CLEAN_MODE and self.is_path_hidden(p): continue
                 name = p.split('/')[-1]
-                item = QStandardItem(name)
+                item = QStandardItem(self._display_name(name))
                 item.setData(p, Qt.ItemDataRole.UserRole)
                 item.setEditable(False)
                 if mode == EDIT_FILTER_MODE:
