@@ -574,7 +574,7 @@ class ExportProgressDialog(QDialog):
 class FastZipBrowser(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cellebrite FFS Explorer (Linux Friendly)")
+        self.setWindowTitle("iOS FFS Browser")
         self.resize(1350, 850)
 
         self.zip_path = ""
@@ -1055,23 +1055,26 @@ class FastZipBrowser(QMainWindow):
 
     def eventFilter(self, obj, event):
         if obj is self.hex_view.viewport() and event.type() == QEvent.Type.Resize:
-            self._fit_hex_font()
+            QTimer.singleShot(0, self._fit_hex_font)
         return super().eventFilter(obj, event)
-
-    _HEX_PADDING_PX = 16  # stylesheet "padding: 4px 8px" → 8px left + 8px right
 
     def _fit_hex_font(self):
         if self._fitting_hex_font:
             return
-        vp_width = self.hex_view.viewport().width() - self._HEX_PADDING_PX
+        vp_width = self.hex_view.viewport().width()
         if vp_width <= 0:
             return
         font = self.hex_view.font()
-        char_w = QFontMetricsF(font).horizontalAdvance('W')
-        if char_w <= 0:
-            return
+        fm = QFontMetricsF(font)
+        # Measure the full line as a string — more accurate than single-char × count
         line_chars = _HEX_ASCII_START + _HEX_BYTES_PER_ROW  # 146
-        new_size = font.pointSizeF() * (vp_width / (char_w * line_chars))
+        line_width = fm.horizontalAdvance('W' * line_chars)
+        if line_width <= 0:
+            return
+        # Subtract the document's own left+right margin from available width
+        doc_margin = self.hex_view.document().documentMargin()
+        usable = vp_width - 2 * doc_margin - 2  # 2px safety against sub-pixel rounding
+        new_size = font.pointSizeF() * (usable / line_width) * 0.95
         new_size = max(6.0, min(new_size, 32.0))
         if abs(new_size - font.pointSizeF()) < 0.1:
             return
