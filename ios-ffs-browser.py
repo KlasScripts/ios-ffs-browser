@@ -630,6 +630,8 @@ class FastZipBrowser(QMainWindow):
         self.archive_dropdown = QComboBox()
         self.update_dropdown_ui()
         self.archive_dropdown.activated.connect(self._on_dropdown_activated)
+        self.archive_dropdown.view().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.archive_dropdown.view().customContextMenuRequested.connect(self._on_recent_context_menu)
         self.action_btn = QPushButton("Load FFS")
         self.action_btn.clicked.connect(self.handle_action_button)
         self.open_export_btn = QPushButton("Open Export Folder")
@@ -900,6 +902,7 @@ class FastZipBrowser(QMainWindow):
         new_idx = self.tree_model.indexFromItem(current)
         self.tree_view.setCurrentIndex(new_idx)
         self.tree_view.scrollTo(new_idx, QTreeView.ScrollHint.PositionAtCenter)
+        self._view_is_recursive = False
         self.on_folder_selected(new_idx)
 
     def on_file_selected(self, index):
@@ -1615,6 +1618,27 @@ class FastZipBrowser(QMainWindow):
 
     def load_settings(self):
         return set(_load_json_file(resource_path(SETTINGS_FILE), []))
+
+    def _on_recent_context_menu(self, point):
+        view = self.archive_dropdown.view()
+        index = view.indexAt(point)
+        if not index.isValid():
+            return
+        text = self.archive_dropdown.itemText(index.row())
+        if not text or text == NEW_ARCHIVE_SENTINEL:
+            return
+        menu = QMenu(self)
+        act = QAction(f"Remove from recent list", self)
+        act.triggered.connect(lambda: self._remove_recent(text))
+        menu.addAction(act)
+        menu.exec(view.viewport().mapToGlobal(point))
+
+    def _remove_recent(self, path):
+        if path in self.recent_paths:
+            self.recent_paths.remove(path)
+            with open(RECENT_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.recent_paths, f)
+            self.update_dropdown_ui()
 
     def load_recent_list(self):
         return _load_json_file(RECENT_FILE, [])
