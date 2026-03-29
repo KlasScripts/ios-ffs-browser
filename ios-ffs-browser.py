@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView,
                               QHBoxLayout, QWidget, QHeaderView, QPushButton,
                               QFileDialog, QProgressBar, QMenu, QDialog,
                               QRadioButton, QButtonGroup, QComboBox, QSplitter, QStatusBar,
-                              QGroupBox, QLineEdit, QLabel, QPlainTextEdit, QFrame, QTextEdit)
+                              QLineEdit, QLabel, QPlainTextEdit, QFrame, QTextEdit)
 from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QFont,
                            QCursor, QColor, QTextCharFormat, QTextCursor, QFontMetricsF)
 from PySide6.QtCore import Qt, QThread, Signal, QSortFilterProxyModel, QTimer, QEvent, QModelIndex
@@ -488,6 +488,14 @@ class MultiColumnFilterProxy(QSortFilterProxyModel):
         self._filter_col = col
         self.invalidate()
 
+    def lessThan(self, left, right):
+        # Use numeric sort role if present (e.g. Files column)
+        lv = left.data(Qt.ItemDataRole.UserRole + 1)
+        rv = right.data(Qt.ItemDataRole.UserRole + 1)
+        if lv is not None and rv is not None:
+            return lv < rv
+        return super().lessThan(left, right)
+
     def filterAcceptsRow(self, source_row, source_parent):
         if not self._filter_text:
             return True
@@ -607,6 +615,7 @@ class FastZipBrowser(QMainWindow):
         self._view_is_recursive = False
         self._rebuild_pending = False
         self._load_gen = 0
+        self._hide_empty_folders = False
         self._filter_log_timer = QTimer(self)
         self._filter_log_timer.setSingleShot(True)
         self._filter_log_timer.setInterval(1500)
@@ -615,33 +624,11 @@ class FastZipBrowser(QMainWindow):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
-        layout.setContentsMargins(5, 5, 5, 2)
-        layout.setSpacing(5)
+        layout.setContentsMargins(6, 6, 6, 4)
+        layout.setSpacing(4)
 
-        top_controls = QHBoxLayout()
-
-        folder_view_box = QGroupBox("Folder View")
-        folder_view_layout = QHBoxLayout(folder_view_box)
-        folder_view_layout.setContentsMargins(6, 4, 6, 4)
-        self.view_group = QButtonGroup(self)
-        for i, text in enumerate(["All Folders", "Customise Filter", "Simplified View"]):
-            rb = QRadioButton(text)
-            if i == CLEAN_MODE: rb.setChecked(True)
-            folder_view_layout.addWidget(rb)
-            self.view_group.addButton(rb, i)
-        self.view_group.buttonClicked.connect(self.reload_tree_entirely)
-        top_controls.addWidget(folder_view_box)
-
-        top_controls.addStretch()
-        self.jump_btn = QPushButton("Jump to ▾")
-        self.jump_btn.clicked.connect(self._show_jump_menu)
-        top_controls.addWidget(self.jump_btn)
-        self.collapse_btn = QPushButton("Collapse Tree")
-        self.collapse_btn.clicked.connect(self._collapse_tree)
-        top_controls.addWidget(self.collapse_btn)
-        layout.addLayout(top_controls)
-
-        top_bar = QHBoxLayout()
+        # ── Archive bar ──────────────────────────────────────────────────
+        archive_bar = QHBoxLayout()
         self.archive_dropdown = QComboBox()
         self.update_dropdown_ui()
         self.archive_dropdown.activated.connect(self._on_dropdown_activated)
@@ -651,11 +638,36 @@ class FastZipBrowser(QMainWindow):
         self.action_btn.clicked.connect(self.handle_action_button)
         self.open_export_btn = QPushButton("Open Export Folder")
         self.open_export_btn.clicked.connect(self.ensure_and_open_export_dir)
+        self.folder_view_btn = QPushButton("Folder View ▾")
+        self.folder_view_btn.clicked.connect(self._show_view_mode_menu)
+        archive_bar.addWidget(self.archive_dropdown, 3)
+        archive_bar.addWidget(self.action_btn, 1)
+        archive_bar.addWidget(self.open_export_btn, 1)
+        archive_bar.addWidget(self.folder_view_btn)
+        layout.addLayout(archive_bar)
 
-        top_bar.addWidget(self.archive_dropdown, 3)
-        top_bar.addWidget(self.action_btn, 1)
-        top_bar.addWidget(self.open_export_btn, 1)
-        layout.addLayout(top_bar)
+        # ── Folder view mode — hidden behind a menu button ───────────────
+        self.view_group = QButtonGroup(self)
+        self._view_mode_menu = QMenu(self)
+        for i, text in enumerate(["All Folders", "Customise Filter", "Simplified View"]):
+            act = self._view_mode_menu.addAction(text)
+            act.setCheckable(True)
+            act.setChecked(i == CLEAN_MODE)
+            act.setData(i)
+            rb = QRadioButton()  # kept for button-group logic; not shown in UI
+            if i == CLEAN_MODE: rb.setChecked(True)
+            self.view_group.addButton(rb, i)
+        self._view_mode_menu.addSeparator()
+        self._hide_empty_act = self._view_mode_menu.addAction("Hide Empty && Metadata-Only Folders")
+        self._hide_empty_act.setCheckable(True)
+        self._hide_empty_act.setChecked(False)
+        self._view_mode_menu.triggered.connect(self._on_view_mode_action)
+
+        _section_style = (
+            "font-weight: bold; padding: 3px 6px;"
+            "border-bottom: 1px solid palette(mid);"
+        )
+        _status_style = "color: grey; padding: 1px 6px;"
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self._reset_tree_model()
@@ -665,10 +677,29 @@ class FastZipBrowser(QMainWindow):
         self.tree_view.customContextMenuRequested.connect(self.show_tree_context_menu)
         self.tree_view.clicked.connect(self.on_folder_selected)
         self.tree_view.setToolTip("Right-click a folder to export")
-        self.splitter.addWidget(self.tree_view)
+
+        tree_header = QLabel("Folder Tree")
+        tree_header.setStyleSheet(_section_style)
+        self.jump_btn = QPushButton("Jump to ▾")
+        self.jump_btn.clicked.connect(self._show_jump_menu)
+        self.collapse_btn = QPushButton("Collapse")
+        self.collapse_btn.clicked.connect(self._collapse_tree)
+        tree_top = QHBoxLayout()
+        tree_top.addWidget(tree_header)
+        tree_top.addStretch()
+        tree_top.addWidget(self.jump_btn)
+        tree_top.addWidget(self.collapse_btn)
+
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(2)
+        left_layout.addLayout(tree_top)
+        left_layout.addWidget(self.tree_view)
+        self.splitter.addWidget(left_panel)
 
         self.file_model = QStandardItemModel()
-        self.file_headers = ['Name', 'Created', 'Modified', 'Type', 'Size (Bytes)', 'Path']
+        self.file_headers = ['Name', 'Created', 'Modified', 'Type', 'Size (Bytes)', 'Files', 'Path']
         self.file_model.setHorizontalHeaderLabels(self.file_headers)
 
         self.proxy_model = MultiColumnFilterProxy()
@@ -697,22 +728,14 @@ class FastZipBrowser(QMainWindow):
         self.filter_input.textChanged.connect(self._apply_filter)
         self.filter_col_combo.currentIndexChanged.connect(self._apply_filter)
 
-        _section_style = (
-            "font-weight: bold; padding: 3px 6px;"
-            "border-bottom: 1px solid palette(mid);"
-        )
-        _status_style = "color: grey; padding: 1px 6px;"
-
         browser_header = QLabel("File Browser")
         browser_header.setStyleSheet(_section_style)
-        self.table_status_label = QLabel()
-        self.table_status_label.setStyleSheet(_status_style)
 
-        self.show_selected_btn = QPushButton("No selected files")
-        self.show_selected_btn.setEnabled(False)
+        self.show_selected_btn = QPushButton("Show Selected Files")
+        self.show_selected_btn.setVisible(False)
         self.show_selected_btn.clicked.connect(self._rebuild_file_view_from_checked)
 
-        self.deselect_all_btn = QPushButton("Deselect files")
+        self.deselect_all_btn = QPushButton("Deselect All")
         self.deselect_all_btn.setVisible(False)
         self.deselect_all_btn.clicked.connect(self._deselect_all_files)
 
@@ -721,6 +744,9 @@ class FastZipBrowser(QMainWindow):
         browser_top.addStretch()
         browser_top.addWidget(self.show_selected_btn)
         browser_top.addWidget(self.deselect_all_btn)
+
+        self.table_status_label = QLabel()
+        self.table_status_label.setStyleSheet(_status_style)
 
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
@@ -1215,6 +1241,8 @@ class FastZipBrowser(QMainWindow):
             # Determine type label and whether to grey out
             if is_folder:
                 status = self._folder_content_status(path)
+                if self._hide_empty_folders and status in ("empty", "metadata_only"):
+                    continue
                 if status == "content":
                     file_type = _get_file_type(name, True)
                     grey_row = False
@@ -1228,6 +1256,8 @@ class FastZipBrowser(QMainWindow):
                 file_type = _get_file_type(name, False)
                 grey_row = False
             elif self._is_empty_folder_entry(path):
+                if self._hide_empty_folders:
+                    continue
                 file_type = "Empty Folder"
                 grey_row = True
             else:
@@ -1238,11 +1268,19 @@ class FastZipBrowser(QMainWindow):
             name_item.setData(path, Qt.ItemDataRole.UserRole)
             name_item.setEditable(False)
 
+            if is_folder:
+                fc = self._count_files_recursive(path)
+                file_count = _make_item(f"{fc:,}")
+                file_count.setData(fc, Qt.ItemDataRole.UserRole + 1)
+            else:
+                file_count = _make_item("")
+                file_count.setData(-1, Qt.ItemDataRole.UserRole + 1)
             row_items = [name_item,
                 _make_item(self.format_ts(meta.get('ctime'))),
                 _make_item(self.format_ts(meta.get('mtime'))),
                 _make_item(file_type),
                 _make_item(f"{meta.get('size', 0):,}"),
+                file_count,
                 _make_item(self._display_path(path)),
             ]
 
@@ -1273,6 +1311,21 @@ class FastZipBrowser(QMainWindow):
         """Replace GUID segments in a full path with bundle IDs for display."""
         return '/'.join(self._display_name(seg) for seg in path.split('/'))
 
+    def _count_files_recursive(self, folder_path: str, visited: set = None) -> int:
+        """Return the total number of files under folder_path (recursive, no double-counting)."""
+        if visited is None:
+            visited = set()
+        if folder_path in visited:
+            return 0
+        visited.add(folder_path)
+        count = 0
+        for child in self.folder_map.get(folder_path, []):
+            if child in self.folder_map:
+                count += self._count_files_recursive(child, visited)
+            else:
+                count += 1
+        return count
+
     def format_ts(self, ts):
         if not ts: return ""
         try:
@@ -1296,11 +1349,56 @@ class FastZipBrowser(QMainWindow):
         index = self.tree_view.indexAt(point)
         if not index.isValid(): return
         self.tree_view.setCurrentIndex(index)
+        item = self.tree_model.itemFromIndex(index)
+        folder_path = item.data(Qt.ItemDataRole.UserRole) if item else None
         menu = QMenu(self)
+        mode = self.view_group.checkedId()
+        if mode in (0, CLEAN_MODE) and folder_path is not None:
+            checked_paths = set()
+            self._collect_checked_paths(item, checked_paths)
+            is_ticked = bool(checked_paths)
+            if is_ticked:
+                rec_act = QAction("☐ Recursively Deselect", self)
+                rec_act.triggered.connect(lambda: self._recursive_untick_folder(index))
+            else:
+                rec_act = QAction("☑ Recursively Add All Files", self)
+                rec_act.triggered.connect(lambda: self._recursive_tick_folder(index))
+            menu.addAction(rec_act)
+            menu.addSeparator()
         export_act = QAction("📁 Export Folder (Recursive)", self)
         export_act.triggered.connect(lambda: self.handle_export_request(is_tree=True))
         menu.addAction(export_act)
         menu.exec(self.tree_view.viewport().mapToGlobal(point))
+
+    def _recursive_tick_folder(self, index):
+        """Tick the folder and all its descendants."""
+        item = self.tree_model.itemFromIndex(index)
+        if item is None:
+            return
+        self.tree_model.blockSignals(True)
+        if item.isCheckable():
+            item.setCheckState(Qt.CheckState.Checked)
+        self._cascade_check(item, Qt.CheckState.Checked)
+        self.tree_model.blockSignals(False)
+        self.tree_view.viewport().update()
+        if not self._rebuild_pending:
+            self._rebuild_pending = True
+            QTimer.singleShot(0, self._deferred_rebuild)
+
+    def _recursive_untick_folder(self, index):
+        """Untick the folder and all its descendants."""
+        item = self.tree_model.itemFromIndex(index)
+        if item is None:
+            return
+        self.tree_model.blockSignals(True)
+        if item.isCheckable():
+            item.setCheckState(Qt.CheckState.Unchecked)
+        self._cascade_check(item, Qt.CheckState.Unchecked)
+        self.tree_model.blockSignals(False)
+        self.tree_view.viewport().update()
+        if not self._rebuild_pending:
+            self._rebuild_pending = True
+            QTimer.singleShot(0, self._deferred_rebuild)
 
     # ------------------------------------------------------------------ #
     #  Checkbox-driven file-view helpers (All Folders / Simplified modes) #
@@ -1373,28 +1471,55 @@ class FastZipBrowser(QMainWindow):
                 folder = folders[state['idx']]
                 state['idx'] += 1
                 for child in self.folder_map.get(folder, []):
-                    if child in self.folder_map:
-                        continue  # skip sub-folder entries
+                    is_folder = child in self.folder_map
+                    if is_folder and self._hide_empty_folders and \
+                            self._folder_content_status(child) in ("empty", "metadata_only"):
+                        continue
                     name = child.split('/')[-1]
                     meta = self.full_metadata.get(child, {})
                     name_item = QStandardItem(self._display_name(name))
                     name_item.setData(child, Qt.ItemDataRole.UserRole)
                     name_item.setEditable(False)
-                    if self._in_zip(child):
+                    bold_font = QFont("Arial", weight=QFont.Weight.Bold)
+                    if is_folder:
+                        status = self._folder_content_status(child)
+                        if status == "content":
+                            file_type = _get_file_type(name, True)
+                            grey_row = False
+                        elif status == "metadata_only":
+                            file_type = "Folder - Metadata Only"
+                            grey_row = True
+                        else:
+                            file_type = "Empty Folder"
+                            grey_row = True
+                    elif self._in_zip(child):
                         file_type = _get_file_type(name, False)
                         grey_row = False
                     elif self._is_empty_folder_entry(child):
+                        if self._hide_empty_folders:
+                            continue
                         file_type = "Empty Folder"
                         grey_row = True
                     else:
                         file_type = "Not in Zip"
                         grey_row = True
+                    if is_folder:
+                        fc = self._count_files_recursive(child)
+                        file_count = _make_item(f"{fc:,}")
+                        file_count.setData(fc, Qt.ItemDataRole.UserRole + 1)
+                    else:
+                        file_count = _make_item("")
+                        file_count.setData(-1, Qt.ItemDataRole.UserRole + 1)
                     row_items = [name_item,
                                  _make_item(self.format_ts(meta.get('ctime'))),
                                  _make_item(self.format_ts(meta.get('mtime'))),
                                  _make_item(file_type),
                                  _make_item(f"{meta.get('size', 0):,}"),
+                                 file_count,
                                  _make_item(self._display_path(child))]
+                    if is_folder and not grey_row:
+                        for it in row_items:
+                            it.setFont(bold_font)
                     if grey_row:
                         grey = QColor(Qt.GlobalColor.darkGray)
                         for it in row_items:
@@ -1497,6 +1622,24 @@ class FastZipBrowser(QMainWindow):
         if root:
             self.tree_view.expand(self.tree_model.indexFromItem(root))
 
+    def _show_view_mode_menu(self):
+        self._view_mode_menu.exec(
+            self.folder_view_btn.mapToGlobal(self.folder_view_btn.rect().bottomLeft()))
+
+    def _on_view_mode_action(self, action):
+        if action is self._hide_empty_act:
+            self._hide_empty_folders = action.isChecked()
+            self.reload_tree_entirely()
+            return
+        mode = action.data()
+        for act in self._view_mode_menu.actions():
+            if act.data() is not None:
+                act.setChecked(act.data() == mode)
+        btn = self.view_group.button(mode)
+        if btn:
+            btn.setChecked(True)
+        self.reload_tree_entirely()
+
     def _show_jump_menu(self):
         menu = QMenu(self)
         self._build_jump_menu(menu, FORENSIC_SHORTCUTS)
@@ -1540,8 +1683,7 @@ class FastZipBrowser(QMainWindow):
         self._log(f"SESSION START — Archive loaded: {zip_path}")
         self._reset_tree_model()
         self.tree_view.setModel(self.tree_model)
-        self.show_selected_btn.setText("No selected files")
-        self.show_selected_btn.setEnabled(False)
+        self.show_selected_btn.setVisible(False)
         self.deselect_all_btn.setVisible(False)
         self.progress_bar.setRange(0, 0)
         self.progress_bar.show()
@@ -1630,36 +1772,26 @@ class FastZipBrowser(QMainWindow):
             self.tree_model.blockSignals(False)
             self.save_settings()
         elif mode in (0, CLEAN_MODE):
-            # Cascade the new state to all descendants, then rebuild once
-            state = item.checkState()
-            self.tree_model.blockSignals(True)
-            self._cascade_check(item, state)
-            self.tree_model.blockSignals(False)
-            # blockSignals suppressed dataChanged, so force a repaint now
+            # Single folder tick — expand to show unticked children
+            if item.checkState() == Qt.CheckState.Checked:
+                self.tree_view.expand(self.tree_model.indexFromItem(item))
             self.tree_view.viewport().update()
-            # Defer the (potentially slow) rebuild so rapid clicks coalesce
             if not self._rebuild_pending:
                 self._rebuild_pending = True
                 QTimer.singleShot(0, self._deferred_rebuild)
 
     def _update_selected_btn(self):
-        """Recount ticked folders and update the show/deselect buttons."""
+        """Recount ticked folders and update the status label and deselect button."""
         checked = set()
         self._collect_checked_paths(self.tree_model.invisibleRootItem(), checked)
-        # Count total files across all ticked folders
-        count = sum(
-            1 for folder in checked
-            for child in self.folder_map.get(folder, [])
-            if child not in self.folder_map
-        )
-        if count > 0:
-            self.show_selected_btn.setText(f"Show {count:,} selected files")
-            self.show_selected_btn.setEnabled(True)
-            self.deselect_all_btn.setVisible(True)
-        else:
-            self.show_selected_btn.setText("No selected files")
-            self.show_selected_btn.setEnabled(False)
+        if not checked:
+            self.show_selected_btn.setVisible(False)
             self.deselect_all_btn.setVisible(False)
+            return
+        item_count = sum(len(self.folder_map.get(folder, [])) for folder in checked)
+        self.show_selected_btn.setText(f"Show {item_count:,} Selected Items")
+        self.show_selected_btn.setVisible(True)
+        self.deselect_all_btn.setVisible(True)
 
     def _deselect_all_files(self):
         """Untick all folders in the tree and clear the file browser."""
@@ -1668,15 +1800,19 @@ class FastZipBrowser(QMainWindow):
         self._cascade_check(root, Qt.CheckState.Unchecked)
         self.tree_model.blockSignals(False)
         self.tree_view.viewport().update()
-        # Clear the file view
-        empty_model = QStandardItemModel()
-        empty_model.setHorizontalHeaderLabels(self.file_headers)
-        self.file_model = empty_model
-        self.proxy_model.setSourceModel(self.file_model)
         self._view_is_recursive = False
-        self._update_filter_columns(self.file_headers)
-        self._refresh_table_status()
         self._update_selected_btn()
+        # Show the highlighted folder if one is selected, otherwise clear
+        idx = self.tree_view.currentIndex()
+        if idx.isValid():
+            self.on_folder_selected(idx)
+        else:
+            empty_model = QStandardItemModel()
+            empty_model.setHorizontalHeaderLabels(self.file_headers)
+            self.file_model = empty_model
+            self.proxy_model.setSourceModel(self.file_model)
+            self._update_filter_columns(self.file_headers)
+            self._refresh_table_status()
 
     def _deferred_rebuild(self):
         self._rebuild_pending = False
