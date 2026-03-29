@@ -180,17 +180,31 @@ def _get_file_type(name, is_folder):
     return 'Other'
 
 
-def _cellebrite_path(ui_path: str) -> str:
-    """Resolve a ui_path to its physical location inside a Cellebrite zip."""
-    parts = []
-    for part in ui_path.split('/'):
-        if '-' in part:
-            suffix = part.split('-')[-1]
-            if len(suffix) >= 32 and all(c in '0123456789abcdefABCDEF' for c in suffix):
-                parts.append(suffix)
-                continue
-        parts.append(part)
-    return f"filesystem2/{'/'.join(parts)}"
+def _detect_cellebrite_prefix(zip_names: frozenset) -> str:
+    """Return the filesystemN prefix that contains the user partition.
+    Checks for folders unique to the iOS user partition (mobile, wireless).
+    Tries filesystem1 through filesystem9; falls back to filesystem2."""
+    for n in range(1, 10):
+        prefix = f"filesystem{n}"
+        for root in ('mobile', 'wireless'):
+            if f"{prefix}/{root}/" in zip_names or f"{prefix}/{root}" in zip_names:
+                return prefix
+    return "filesystem2"
+
+
+def _make_cellebrite_path(prefix: str):
+    """Return a path resolver that maps ui_paths to physical zip paths under prefix."""
+    def _resolve(ui_path: str) -> str:
+        parts = []
+        for part in ui_path.split('/'):
+            if '-' in part:
+                suffix = part.split('-')[-1]
+                if len(suffix) >= 32 and all(c in '0123456789abcdefABCDEF' for c in suffix):
+                    parts.append(suffix)
+                    continue
+            parts.append(part)
+        return f"{prefix}/{'/'.join(parts)}"
+    return _resolve
 
 
 def _graykey_path(ui_path: str) -> str:
@@ -377,7 +391,8 @@ class ZipMetadataWorker(QThread):
                     self.status_update.emit("Reading metadata.msgpack...")
                     with z.open('metadata2/metadata.msgpack') as f:
                         raw_data = msgpack.unpack(f)
-                    path_resolver = _cellebrite_path
+                    prefix = _detect_cellebrite_prefix(zip_names)
+                    path_resolver = _make_cellebrite_path(prefix)
 
             self.status_update.emit("Generating tree...")
             ui_metadata = {}
@@ -585,7 +600,7 @@ class FastZipBrowser(QMainWindow):
         self._real_content_cache: dict = {}
         self._zip_handle: zipfile.ZipFile | None = None
         self._hex_worker: QThread | None = None
-        self._path_resolver = _cellebrite_path
+        self._path_resolver = _make_cellebrite_path("filesystem2")
         self.hidden_paths = self.load_settings()
         self.recent_paths = self.load_recent_list()
         self._view_path = ""
