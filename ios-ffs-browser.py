@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView,
                               QGroupBox, QLineEdit, QLabel, QPlainTextEdit, QFrame, QTextEdit)
 from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QFont,
                            QCursor, QColor, QTextCharFormat, QTextCursor, QFontMetricsF)
-from PySide6.QtCore import Qt, QThread, Signal, QSortFilterProxyModel, QTimer, QEvent
+from PySide6.QtCore import Qt, QThread, Signal, QSortFilterProxyModel, QTimer, QEvent, QModelIndex
 
 SETTINGS_FILE = "forensic_settings.json"
 RECENT_FILE = "recent_archives.json"
@@ -708,11 +708,25 @@ class FastZipBrowser(QMainWindow):
         self.table_status_label = QLabel()
         self.table_status_label.setStyleSheet(_status_style)
 
+        self.show_selected_btn = QPushButton("No selected files")
+        self.show_selected_btn.setEnabled(False)
+        self.show_selected_btn.clicked.connect(self._rebuild_file_view_from_checked)
+
+        self.deselect_all_btn = QPushButton("Deselect files")
+        self.deselect_all_btn.setVisible(False)
+        self.deselect_all_btn.clicked.connect(self._deselect_all_files)
+
+        browser_top = QHBoxLayout()
+        browser_top.addWidget(browser_header)
+        browser_top.addStretch()
+        browser_top.addWidget(self.show_selected_btn)
+        browser_top.addWidget(self.deselect_all_btn)
+
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(2)
-        right_layout.addWidget(browser_header)
+        right_layout.addLayout(browser_top)
         right_layout.addWidget(self.table_status_label)
         right_layout.addLayout(filter_bar)
         right_layout.addWidget(self.file_view)
@@ -1173,9 +1187,8 @@ class FastZipBrowser(QMainWindow):
         self.status_bar.showMessage(f"{folder_path}    |    Tip: Right-click to export")
         self._log(f"Folder viewed: {folder_path}")
 
-        # In checkbox-driven modes, only block the click if checkboxes are actually driving the view
-        if self.view_group.checkedId() in (0, CLEAN_MODE) and self._view_is_recursive:
-            return
+        # Clicking a folder name always shows that folder — clears ticked view
+        self._view_is_recursive = False
 
         children = self.folder_map.get(folder_path, [])
         has_bundles = any(p.split('/')[-1] in self.guid_to_bundle for p in children)
@@ -1319,6 +1332,9 @@ class FastZipBrowser(QMainWindow):
         self._collect_checked_paths(self.tree_model.invisibleRootItem(), checked)
         self._view_path = ""
         self._view_is_recursive = bool(checked)
+        if checked:
+            self.tree_view.clearSelection()
+            self.tree_view.setCurrentIndex(QModelIndex())
 
         # Bump generation — any in-flight batch will see the change and abort
         self._load_gen += 1
@@ -1524,6 +1540,9 @@ class FastZipBrowser(QMainWindow):
         self._log(f"SESSION START — Archive loaded: {zip_path}")
         self._reset_tree_model()
         self.tree_view.setModel(self.tree_model)
+        self.show_selected_btn.setText("No selected files")
+        self.show_selected_btn.setEnabled(False)
+        self.deselect_all_btn.setVisible(False)
         self.progress_bar.setRange(0, 0)
         self.progress_bar.show()
         self.worker = ZipMetadataWorker(zip_path)
@@ -1623,8 +1642,45 @@ class FastZipBrowser(QMainWindow):
                 self._rebuild_pending = True
                 QTimer.singleShot(0, self._deferred_rebuild)
 
+    def _update_selected_btn(self):
+        """Recount ticked folders and update the show/deselect buttons."""
+        checked = set()
+        self._collect_checked_paths(self.tree_model.invisibleRootItem(), checked)
+        # Count total files across all ticked folders
+        count = sum(
+            1 for folder in checked
+            for child in self.folder_map.get(folder, [])
+            if child not in self.folder_map
+        )
+        if count > 0:
+            self.show_selected_btn.setText(f"Show {count:,} selected files")
+            self.show_selected_btn.setEnabled(True)
+            self.deselect_all_btn.setVisible(True)
+        else:
+            self.show_selected_btn.setText("No selected files")
+            self.show_selected_btn.setEnabled(False)
+            self.deselect_all_btn.setVisible(False)
+
+    def _deselect_all_files(self):
+        """Untick all folders in the tree and clear the file browser."""
+        self.tree_model.blockSignals(True)
+        root = self.tree_model.invisibleRootItem()
+        self._cascade_check(root, Qt.CheckState.Unchecked)
+        self.tree_model.blockSignals(False)
+        self.tree_view.viewport().update()
+        # Clear the file view
+        empty_model = QStandardItemModel()
+        empty_model.setHorizontalHeaderLabels(self.file_headers)
+        self.file_model = empty_model
+        self.proxy_model.setSourceModel(self.file_model)
+        self._view_is_recursive = False
+        self._update_filter_columns(self.file_headers)
+        self._refresh_table_status()
+        self._update_selected_btn()
+
     def _deferred_rebuild(self):
         self._rebuild_pending = False
+        self._update_selected_btn()
         self._rebuild_file_view_from_checked()
 
     def save_settings(self):
