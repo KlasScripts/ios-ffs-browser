@@ -100,17 +100,24 @@ def _parse_entry(f: zipfile.ZipInfo) -> dict:
 
     # Timestamps from UT block: flags(1B) mtime atime ctime btime (each 4B)
     ut = _find_block(extra, _TAG_UT)
-    _, mtime, atime, ctime, btime = _unpack_date_data(ut)
+    if ut is not None:
+        _, mtime, atime, ctime, btime = _unpack_date_data(ut)
+    else:
+        mtime = atime = ctime = btime = 0
 
     # UID/GID from UX block: version(1B) uid_sz(1B) uid(uid_sz B) gid_sz(1B) gid(gid_sz B)
     ux = _find_block(extra, _TAG_UX)
-    uid_sz = ux[1]
-    uid    = int.from_bytes(ux[2:2 + uid_sz], 'little')
-    gid_off = 2 + uid_sz
-    gid    = int.from_bytes(ux[gid_off + 1:gid_off + 1 + ux[gid_off]], 'little')
+    if ux is not None:
+        uid_sz = ux[1]
+        uid    = int.from_bytes(ux[2:2 + uid_sz], 'little')
+        gid_off = 2 + uid_sz
+        gid    = int.from_bytes(ux[gid_off + 1:gid_off + 1 + ux[gid_off]], 'little')
+    else:
+        uid = gid = 0
 
     # Inode from IN block: inode(Q=8B) + additional fields (ignored)
-    inode = int.from_bytes(_find_block(extra, _TAG_IN)[:8], 'little')
+    in_block = _find_block(extra, _TAG_IN)
+    inode = int.from_bytes(in_block[:8], 'little') if in_block is not None else 0
 
     # Graykey block: version(1B) flags(1B) [prot_class(4B)] [xattrs]
     gk    = _find_gk_block(extra)
