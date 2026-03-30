@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import time
 import struct
 import zipfile
@@ -17,7 +18,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView,
                               QLineEdit, QLabel, QPlainTextEdit, QFrame, QTextEdit)
 from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QFont,
                            QCursor, QColor, QTextCharFormat, QTextCursor, QFontMetricsF)
-from PySide6.QtCore import Qt, QThread, Signal, QSortFilterProxyModel, QTimer, QEvent, QModelIndex
+from PySide6.QtCore import Qt, QThread, Signal, QSortFilterProxyModel, QTimer, QEvent, QModelIndex, QAbstractTableModel
 
 SETTINGS_FILE = "forensic_settings.json"
 RECENT_FILE = "recent_archives.json"
@@ -75,6 +76,10 @@ _SYSTEM_METADATA_NAMES: frozenset = frozenset({
     ".com.apple.FairPlay.MachineIdentifier",
     ".com.apple.springboard.shortcuts",
 })
+_TREE_PLACEHOLDER = "__placeholder__"
+_UUID_RE = re.compile(
+    r'^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
+)
 CLEAN_MODE = 2
 
 FORENSIC_SHORTCUTS = [
@@ -349,7 +354,7 @@ class ExtractorWorker(QThread):
 
 class ZipMetadataWorker(QThread):
     status_update = Signal(str)
-    metadata_ready = Signal(dict, dict, dict, object, object)
+    metadata_ready = Signal(dict, dict, dict, object, object, object)
 
     def __init__(self, zip_path):
         super().__init__()
@@ -417,7 +422,22 @@ class ZipMetadataWorker(QThread):
                         break
                     current = parent
 
-            self.metadata_ready.emit(ui_metadata, folder_map, guid_to_bundle, zip_names, path_resolver)
+            # Find UUID-shaped container folders (in the three known locations)
+            # that have no bundle ID mapping — their metadata.plist is absent
+            # or unreadable, which may indicate a corrupt/incomplete download.
+            _CONTAINER_PARENTS = (
+                "mobile/Containers/Data/Application",
+                "mobile/Containers/Data/PluginKitPlugin",
+                "mobile/Containers/Shared/AppGroup",
+            )
+            missing_plist_paths = [
+                p for p in folder_map
+                if p.rsplit('/', 1)[0] in _CONTAINER_PARENTS
+                and _UUID_RE.match(p.split('/')[-1])
+                and p.split('/')[-1] not in guid_to_bundle
+            ]
+
+            self.metadata_ready.emit(ui_metadata, folder_map, guid_to_bundle, zip_names, path_resolver, missing_plist_paths)
         except Exception as e:
             self.status_update.emit(f"Error: {str(e)}")
 
@@ -477,34 +497,153 @@ class HexLoadWorker(QThread):
             self.error.emit(str(e))
 
 
-class MultiColumnFilterProxy(QSortFilterProxyModel):
-    def __init__(self):
-        super().__init__()
-        self._filter_text = ""
-        self._filter_col = -1  # -1 = all columns
+_FILTER_CHUNK = 8000   # rows processed per frame during incremental filter
+
+
+class FileTableModel(QAbstractTableModel):
+    """Lightweight table model backed by a plain Python list.
+    Dramatically faster than QStandardItemModel for large row counts:
+    no per-cell QStandardItem allocation, sort() runs as a native
+    Python list sort, and filtering is incremental (chunked per frame)
+    so the visible row count decreases live while filtering runs."""
+
+    filter_progress = Signal(int, int)   # (visible, total)
+    filter_done     = Signal(int, int)   # (visible, total)
+
+    _GREY_COLOR = QColor(Qt.GlobalColor.darkGray)
+    _BOLD_FONT  = QFont("Arial", weight=QFont.Weight.Bold)
+
+    def __init__(self, headers, parent=None):
+        super().__init__(parent)
+        self._headers  = list(headers)
+        self._all_rows = []   # all rows, never modified by filtering
+        self._rows     = []   # currently visible (filtered) rows
+        self._files_col = self._headers.index('Files') if 'Files' in self._headers else -1
+        self._filter_gen = 0  # bump to cancel an in-flight filter
+
+    # ── required overrides ──────────────────────────────────────────────────
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._headers)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or index.row() >= len(self._rows):
+            return None
+        row = self._rows[index.row()]
+        col = index.column()
+        if role == Qt.ItemDataRole.DisplayRole:
+            cols = row[0]
+            return cols[col] if col < len(cols) else None
+        if role == Qt.ItemDataRole.UserRole:
+            return row[1]
+        if role == Qt.ItemDataRole.UserRole + 1:
+            return row[2]
+        if role == Qt.ItemDataRole.ForegroundRole:
+            return self._GREY_COLOR if row[4] else None
+        if role == Qt.ItemDataRole.FontRole:
+            return self._BOLD_FONT if row[3] else None
+        return None
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
+            return self._headers[section] if 0 <= section < len(self._headers) else None
+        return None
+
+    # ── bulk mutation ────────────────────────────────────────────────────────
+
+    def append_rows_batch(self, rows):
+        """Append rows to both _all_rows and _rows (no active filter)."""
+        if not rows:
+            return
+        first = len(self._rows)
+        last  = first + len(rows) - 1
+        self.beginInsertRows(QModelIndex(), first, last)
+        self._all_rows.extend(rows)
+        self._rows.extend(rows)
+        self.endInsertRows()
+
+    # ── filtering ────────────────────────────────────────────────────────────
 
     def set_filter(self, text, col):
-        self._filter_text = text.lower()
-        self._filter_col = col
-        self.invalidate()
+        """Start an incremental filter. Clears visible rows immediately, then
+        adds matching rows in chunks so the UI count updates live."""
+        self._filter_gen += 1
+        my_gen = self._filter_gen
+        needle = text.lower()
+        ncols  = self.columnCount()
+        check_cols = list(range(ncols)) if col < 0 else [col]
+        total  = len(self._all_rows)
 
-    def lessThan(self, left, right):
-        # Use numeric sort role if present (e.g. Files column)
-        lv = left.data(Qt.ItemDataRole.UserRole + 1)
-        rv = right.data(Qt.ItemDataRole.UserRole + 1)
-        if lv is not None and rv is not None:
-            return lv < rv
-        return super().lessThan(left, right)
+        # Clear visible rows immediately
+        self.beginResetModel()
+        self._rows = []
+        self.endResetModel()
 
-    def filterAcceptsRow(self, source_row, source_parent):
-        if not self._filter_text:
-            return True
-        model = self.sourceModel()
-        cols = range(model.columnCount()) if self._filter_col < 0 else [self._filter_col]
-        return any(
-            (item := model.item(source_row, c)) is not None and self._filter_text in item.text().lower()
-            for c in cols
-        )
+        if not needle:
+            # No filter — restore all rows in one shot
+            self.beginInsertRows(QModelIndex(), 0, total - 1)
+            self._rows = list(self._all_rows)
+            self.endInsertRows()
+            self.filter_done.emit(total, total)
+            return
+
+        source = self._all_rows
+        idx = [0]
+
+        def _chunk():
+            if self._filter_gen != my_gen:
+                return  # superseded
+            end = min(idx[0] + _FILTER_CHUNK, total)
+            matched = [
+                r for r in source[idx[0]:end]
+                if any(r[0][c].lower().find(needle) != -1
+                       for c in check_cols if c < len(r[0]))
+            ]
+            if matched:
+                first = len(self._rows)
+                last  = first + len(matched) - 1
+                self.beginInsertRows(QModelIndex(), first, last)
+                self._rows.extend(matched)
+                self.endInsertRows()
+            idx[0] = end
+            self.filter_progress.emit(len(self._rows), total)
+            if idx[0] < total:
+                QTimer.singleShot(0, _chunk)
+            else:
+                self.filter_done.emit(len(self._rows), total)
+
+        QTimer.singleShot(0, _chunk)
+
+    # ── sorting ──────────────────────────────────────────────────────────────
+
+    def sort(self, column, order=Qt.SortOrder.AscendingOrder):
+        """Sort both _all_rows and _rows so sort survives re-filtering."""
+        self.layoutAboutToBeChanged.emit()
+        reverse = (order == Qt.SortOrder.DescendingOrder)
+        key = (lambda r: r[2]) if column == self._files_col else \
+              (lambda r: r[0][column].lower() if column < len(r[0]) and r[0][column] else '')
+        self._all_rows.sort(key=key, reverse=reverse)
+        self._rows.sort(key=key, reverse=reverse)
+        self.layoutChanged.emit()
+
+
+class MultiColumnFilterProxy(QSortFilterProxyModel):
+    """Thin proxy used only for sort delegation — filtering is now handled
+    inside FileTableModel so filterAcceptsRow always returns True."""
+
+    def sort(self, column, order=Qt.SortOrder.AscendingOrder):
+        src = self.sourceModel()
+        if src is not None:
+            src.sort(column, order)
+            self.invalidate()
+
+    def set_filter(self, text, col):
+        src = self.sourceModel()
+        if src is not None:
+            src.set_filter(text, col)
 
 
 class ExportProgressDialog(QDialog):
@@ -616,10 +755,9 @@ class FastZipBrowser(QMainWindow):
         self._rebuild_pending = False
         self._load_gen = 0
         self._hide_empty_folders = False
-        self._filter_log_timer = QTimer(self)
-        self._filter_log_timer.setSingleShot(True)
-        self._filter_log_timer.setInterval(1500)
-        self._filter_log_timer.timeout.connect(self._log_filter_final)
+        self._missing_plist_paths: set = set()
+        self._tree_populating = False
+
 
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -676,6 +814,7 @@ class FastZipBrowser(QMainWindow):
         self.tree_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree_view.customContextMenuRequested.connect(self.show_tree_context_menu)
         self.tree_view.clicked.connect(self.on_folder_selected)
+        self.tree_view.expanded.connect(self._on_tree_item_expanded)
         self.tree_view.setToolTip("Right-click a folder to export")
 
         tree_header = QLabel("Folder Tree")
@@ -698,12 +837,9 @@ class FastZipBrowser(QMainWindow):
         left_layout.addWidget(self.tree_view)
         self.splitter.addWidget(left_panel)
 
-        self.file_model = QStandardItemModel()
         self.file_headers = ['Name', 'Created', 'Modified', 'Type', 'Size (Bytes)', 'Files', 'Path']
-        self.file_model.setHorizontalHeaderLabels(self.file_headers)
-
         self.proxy_model = MultiColumnFilterProxy()
-        self.proxy_model.setSourceModel(self.file_model)
+        self._set_file_model(FileTableModel(self.file_headers))
 
         self.file_view = QTableView()
         self.file_view.setModel(self.proxy_model)
@@ -723,10 +859,16 @@ class FastZipBrowser(QMainWindow):
         filter_bar.addWidget(self.filter_col_combo)
         self.filter_input = QLineEdit()
         self.filter_input.setPlaceholderText("Type to filter rows...")
-        self.filter_input.setClearButtonEnabled(True)
+        self.filter_input.returnPressed.connect(self._apply_filter)
         filter_bar.addWidget(self.filter_input)
-        self.filter_input.textChanged.connect(self._apply_filter)
-        self.filter_col_combo.currentIndexChanged.connect(self._apply_filter)
+        self.filter_go_btn = QPushButton("Go")
+        self.filter_go_btn.setMaximumWidth(40)
+        self.filter_go_btn.clicked.connect(self._apply_filter)
+        self.filter_clear_btn = QPushButton("Clear")
+        self.filter_clear_btn.setMaximumWidth(50)
+        self.filter_clear_btn.clicked.connect(self._clear_filter)
+        filter_bar.addWidget(self.filter_go_btn)
+        filter_bar.addWidget(self.filter_clear_btn)
 
         browser_header = QLabel("File Browser")
         browser_header.setStyleSheet(_section_style)
@@ -816,12 +958,37 @@ class FastZipBrowser(QMainWindow):
         self.status_bar.addPermanentWidget(self.progress_bar)
         self.status_bar.showMessage("Ready")
 
+    def _set_file_model(self, model):
+        """Set the file model, connect its filter signals, and update the proxy."""
+        self.file_model = model
+        self.proxy_model.setSourceModel(model)
+        model.filter_progress.connect(self._on_filter_progress)
+        model.filter_done.connect(self._on_filter_done)
+
+    def _on_filter_progress(self, visible, total):
+        self.table_status_label.setText(f"{visible:,} of {total:,} items (filtering…)")
+
+    def _on_filter_done(self, visible, total):
+        if visible == total:
+            self.table_status_label.setText(f"{total:,} items")
+        else:
+            self.table_status_label.setText(f"{visible:,} of {total:,} items (filtered)")
+        col_name = self.filter_col_combo.currentText()
+        text = self.filter_input.text()
+        if text:
+            self._log(f"Filter applied: \"{text}\" in {col_name} — {visible:,} of {total:,} rows visible")
+
     def _apply_filter(self):
         col = self.filter_col_combo.currentIndex() - 1  # index 0 = "All Columns" → -1
         text = self.filter_input.text()
+        total = self.file_model.rowCount()
+        self.table_status_label.setText(f"0 of {total:,} items (filtering…)")
         self.proxy_model.set_filter(text, col)
-        self._refresh_table_status()
-        self._filter_log_timer.start()  # restarts if already running
+
+    def _clear_filter(self):
+        self.filter_input.clear()
+        self.proxy_model.set_filter("", -1)
+        self._log(f"Filter cleared in: {self._view_path}")
 
     def _log_filter_final(self):
         text = self.filter_input.text()
@@ -927,7 +1094,7 @@ class FastZipBrowser(QMainWindow):
 
     def handle_table_double_click(self, index):
         source = self.proxy_model.mapToSource(index)
-        ui_path = self.file_model.item(source.row(), 0).data(Qt.ItemDataRole.UserRole)
+        ui_path = self.file_model.index(source.row(), 0).data(Qt.ItemDataRole.UserRole)
         if ui_path in self.folder_map:
             self.navigate_tree_to_path(ui_path)
         elif ui_path and self._in_zip(ui_path):
@@ -939,6 +1106,7 @@ class FastZipBrowser(QMainWindow):
         if invisible_root.rowCount() == 0:
             return
         current = invisible_root.child(0)  # "/ [Full Filesystem]"
+        self._ensure_children_loaded(current)
         self.tree_view.expand(self.tree_model.indexFromItem(current))
         parts = [p for p in target_path.split('/') if p]
 
@@ -948,6 +1116,7 @@ class FastZipBrowser(QMainWindow):
                 child = current.child(row)
                 child_path = child.data(Qt.ItemDataRole.UserRole)
                 if child_path is not None and child_path.split('/')[-1] == part:
+                    self._ensure_children_loaded(child)
                     self.tree_view.expand(self.tree_model.indexFromItem(child))
                     current = child
                     found = True
@@ -962,7 +1131,7 @@ class FastZipBrowser(QMainWindow):
 
     def on_file_selected(self, index):
         source = self.proxy_model.mapToSource(index)
-        ui_path = self.file_model.item(source.row(), 0).data(Qt.ItemDataRole.UserRole)
+        ui_path = self.file_model.index(source.row(), 0).data(Qt.ItemDataRole.UserRole)
         if not ui_path:
             return
         self.status_bar.showMessage(ui_path)
@@ -1224,24 +1393,24 @@ class FastZipBrowser(QMainWindow):
         else:
             headers = self.file_headers
 
-        new_model = QStandardItemModel()
-        new_model.setHorizontalHeaderLabels(headers)
+        new_model = FileTableModel(headers)
         self._update_filter_columns(headers)
         self.filter_input.clear()
+        self.proxy_model.set_filter("", -1)
         self._view_path = folder_path
         self._view_is_recursive = False
 
+        batch = []
         for path in sorted(children):
             name = path.split('/')[-1]
             meta = self.full_metadata.get(path, {})
-
             is_folder = path in self.folder_map
-            bold_font = QFont("Arial", weight=QFont.Weight.Bold)
 
             # Determine type label and whether to grey out
             if is_folder:
                 status = self._folder_content_status(path)
-                if self._hide_empty_folders and status in ("empty", "metadata_only"):
+                if self._hide_empty_folders and status in ("empty", "metadata_only") \
+                        and path not in self._missing_plist_paths:
                     continue
                 if status == "content":
                     file_type = _get_file_type(name, True)
@@ -1264,41 +1433,23 @@ class FastZipBrowser(QMainWindow):
                 file_type = "Not in Zip"
                 grey_row = True
 
-            name_item = QStandardItem(self._display_name(name))
-            name_item.setData(path, Qt.ItemDataRole.UserRole)
-            name_item.setEditable(False)
-
-            if is_folder:
-                fc = self._count_files_recursive(path)
-                file_count = _make_item(f"{fc:,}")
-                file_count.setData(fc, Qt.ItemDataRole.UserRole + 1)
-            else:
-                file_count = _make_item("")
-                file_count.setData(-1, Qt.ItemDataRole.UserRole + 1)
-            row_items = [name_item,
-                _make_item(self.format_ts(meta.get('ctime'))),
-                _make_item(self.format_ts(meta.get('mtime'))),
-                _make_item(file_type),
-                _make_item(f"{meta.get('size', 0):,}"),
-                file_count,
-                _make_item(self._display_path(path)),
+            fc = self._count_files_recursive(path) if is_folder else -1
+            cols = [
+                self._display_name(name),
+                self.format_ts(meta.get('ctime')),
+                self.format_ts(meta.get('mtime')),
+                file_type,
+                f"{meta.get('size', 0):,}",
+                f"{fc:,}" if is_folder else "",
+                self._display_path(path),
             ]
-
             if has_bundles:
-                row_items.append(_make_item(name if name in self.guid_to_bundle else ""))
+                cols.append(name if name in self.guid_to_bundle else "")
 
-            if is_folder and not grey_row:
-                for item in row_items:
-                    item.setFont(bold_font)
-            if grey_row:
-                grey = QColor(Qt.GlobalColor.darkGray)
-                for item in row_items:
-                    item.setForeground(grey)
+            batch.append((cols, path, fc, is_folder and not grey_row, grey_row))
 
-            new_model.appendRow(row_items)
-
-        self.file_model = new_model
-        self.proxy_model.setSourceModel(self.file_model)
+        new_model.append_rows_batch(batch)
+        self._set_file_model(new_model)
 
         self.file_view.resizeColumnsToContents()
         self._refresh_table_status()
@@ -1375,6 +1526,9 @@ class FastZipBrowser(QMainWindow):
         item = self.tree_model.itemFromIndex(index)
         if item is None:
             return
+        self._tree_populating = True
+        self._ensure_all_descendants_loaded(item)
+        self._tree_populating = False
         self.tree_model.blockSignals(True)
         if item.isCheckable():
             item.setCheckState(Qt.CheckState.Checked)
@@ -1439,10 +1593,7 @@ class FastZipBrowser(QMainWindow):
         my_gen = self._load_gen
 
         # Swap in an empty model immediately so the checkbox tick feels instant
-        new_model = QStandardItemModel()
-        new_model.setHorizontalHeaderLabels(self.file_headers)
-        self.file_model = new_model
-        self.proxy_model.setSourceModel(self.file_model)
+        self._set_file_model(FileTableModel(self.file_headers))
 
         if not checked:
             # Fall back to showing the currently highlighted folder, if any
@@ -1466,6 +1617,7 @@ class FastZipBrowser(QMainWindow):
 
             # Process as many folders as fit within ~16 ms (one frame budget)
             deadline = time.monotonic() + FRAME_BUDGET_SECS
+            batch_rows = []
 
             while state['idx'] < total_folders:
                 folder = folders[state['idx']]
@@ -1473,14 +1625,11 @@ class FastZipBrowser(QMainWindow):
                 for child in self.folder_map.get(folder, []):
                     is_folder = child in self.folder_map
                     if is_folder and self._hide_empty_folders and \
-                            self._folder_content_status(child) in ("empty", "metadata_only"):
+                            self._folder_content_status(child) in ("empty", "metadata_only") \
+                            and child not in self._missing_plist_paths:
                         continue
                     name = child.split('/')[-1]
                     meta = self.full_metadata.get(child, {})
-                    name_item = QStandardItem(self._display_name(name))
-                    name_item.setData(child, Qt.ItemDataRole.UserRole)
-                    name_item.setEditable(False)
-                    bold_font = QFont("Arial", weight=QFont.Weight.Bold)
                     if is_folder:
                         status = self._folder_content_status(child)
                         if status == "content":
@@ -1503,32 +1652,22 @@ class FastZipBrowser(QMainWindow):
                     else:
                         file_type = "Not in Zip"
                         grey_row = True
-                    if is_folder:
-                        fc = self._count_files_recursive(child)
-                        file_count = _make_item(f"{fc:,}")
-                        file_count.setData(fc, Qt.ItemDataRole.UserRole + 1)
-                    else:
-                        file_count = _make_item("")
-                        file_count.setData(-1, Qt.ItemDataRole.UserRole + 1)
-                    row_items = [name_item,
-                                 _make_item(self.format_ts(meta.get('ctime'))),
-                                 _make_item(self.format_ts(meta.get('mtime'))),
-                                 _make_item(file_type),
-                                 _make_item(f"{meta.get('size', 0):,}"),
-                                 file_count,
-                                 _make_item(self._display_path(child))]
-                    if is_folder and not grey_row:
-                        for it in row_items:
-                            it.setFont(bold_font)
-                    if grey_row:
-                        grey = QColor(Qt.GlobalColor.darkGray)
-                        for it in row_items:
-                            it.setForeground(grey)
-                    self.file_model.appendRow(row_items)
+                    fc = self._count_files_recursive(child) if is_folder else -1
+                    cols = [
+                        self._display_name(name),
+                        self.format_ts(meta.get('ctime')),
+                        self.format_ts(meta.get('mtime')),
+                        file_type,
+                        f"{meta.get('size', 0):,}",
+                        f"{fc:,}" if is_folder else "",
+                        self._display_path(child),
+                    ]
+                    batch_rows.append((cols, child, fc, is_folder and not grey_row, grey_row))
                     state['count'] += 1
                 if time.monotonic() >= deadline:
                     break  # yield back to the event loop
 
+            self.file_model.append_rows_batch(batch_rows)
             self.status_bar.showMessage(
                 f"Loading…  {state['count']:,} files  "
                 f"({state['idx']} of {total_folders} folders)")
@@ -1556,7 +1695,7 @@ class FastZipBrowser(QMainWindow):
         menu.addAction(export_act)
 
         source = self.proxy_model.mapToSource(index)
-        ui_path = self.file_model.item(source.row(), 0).data(Qt.ItemDataRole.UserRole)
+        ui_path = self.file_model.index(source.row(), 0).data(Qt.ItemDataRole.UserRole)
 
         if ui_path and ui_path not in self.folder_map and self._in_zip(ui_path):
             hex_act = QAction("🔍 Preview in Hex Viewer", self)
@@ -1585,7 +1724,7 @@ class FastZipBrowser(QMainWindow):
             selected_rows = self.file_view.selectionModel().selectedRows()
             for idx in selected_rows:
                 source = self.proxy_model.mapToSource(idx)
-                ui_path = self.file_model.item(source.row(), 0).data(Qt.ItemDataRole.UserRole)
+                ui_path = self.file_model.index(source.row(), 0).data(Qt.ItemDataRole.UserRole)
                 base_parent = ui_path.rsplit('/', 1)[0] if ui_path in self.folder_map and '/' in ui_path else ui_path
                 tasks.append((ui_path, base_parent))
 
@@ -1685,6 +1824,12 @@ class FastZipBrowser(QMainWindow):
         self.tree_view.setModel(self.tree_model)
         self.show_selected_btn.setVisible(False)
         self.deselect_all_btn.setVisible(False)
+        # Clear the file browser immediately so the previous archive's
+        # content is not shown while the new one is loading.
+        self._set_file_model(FileTableModel(self.file_headers))
+        self._update_filter_columns(self.file_headers)
+        self.table_status_label.setText("")
+        self._view_path = ""
         self.progress_bar.setRange(0, 0)
         self.progress_bar.show()
         self.worker = ZipMetadataWorker(zip_path)
@@ -1692,18 +1837,72 @@ class FastZipBrowser(QMainWindow):
         self.worker.metadata_ready.connect(self.on_metadata_ready)
         self.worker.start()
 
-    def on_metadata_ready(self, data, folder_map, guid_map, zip_names, path_resolver):
+    def on_metadata_ready(self, data, folder_map, guid_map, zip_names, path_resolver, missing_plist_paths):
         self.full_metadata = data
         self.folder_map = folder_map
         self.guid_to_bundle = guid_map
         self.zip_names = zip_names
         self._path_resolver = path_resolver
+        self._missing_plist_paths = set(missing_plist_paths)
         self._real_content_cache = {}
         if self._zip_handle:
             self._zip_handle.close()
         self._zip_handle = zipfile.ZipFile(self.zip_path, 'r')
         self.progress_bar.setRange(0, 100)
         self.reload_tree_entirely()
+        if missing_plist_paths:
+            self._warn_and_select_missing(missing_plist_paths)
+
+    def _warn_and_select_missing(self, paths):
+        from PySide6.QtWidgets import QMessageBox
+        count = len(paths)
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Archive Integrity Warning")
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setText(
+            f"{count} UUID folder{'s' if count != 1 else ''} "
+            f"{'are' if count != 1 else 'is'} missing the expected\n"
+            f".com.apple.mobile_container_manager.metadata.plist file.\n\n"
+            f"This may indicate a corrupt or incomplete download. The bundle ID\n"
+            f"cannot be resolved for these folders — they are displayed using\n"
+            f"their raw UUID. The affected folders have been selected so you\n"
+            f"can press \"Show Selected Items\" to review them."
+        )
+        msg.setDetailedText("\n".join(sorted(paths)))
+        msg.exec()
+        self._tick_items_by_path(set(paths))
+
+    def _tick_items_by_path(self, path_set):
+        """Check the tree item for every path in path_set.
+        Descends only the branches needed, loading lazily as it goes."""
+        for path in path_set:
+            self._tick_single_path(path)
+        self.tree_view.viewport().update()
+        self._update_selected_btn()
+        self._rebuild_file_view_from_checked()
+
+    def _tick_single_path(self, target_path):
+        """Navigate to target_path in the tree, loading lazily, and tick the item."""
+        invisible_root = self.tree_model.invisibleRootItem()
+        if invisible_root.rowCount() == 0:
+            return
+        current = invisible_root.child(0)  # "/ [Full Filesystem]"
+        self._ensure_children_loaded(current)
+        parts = [p for p in target_path.split('/') if p]
+        for part in parts:
+            found = False
+            for row in range(current.rowCount()):
+                child = current.child(row)
+                child_path = child.data(Qt.ItemDataRole.UserRole)
+                if child_path is not None and child_path.split('/')[-1] == part:
+                    self._ensure_children_loaded(child)
+                    current = child
+                    found = True
+                    break
+            if not found:
+                return
+        if current.isCheckable():
+            current.setCheckState(Qt.CheckState.Checked)
 
     def reload_tree_entirely(self):
         if not self.folder_map: return
@@ -1719,40 +1918,91 @@ class FastZipBrowser(QMainWindow):
             root_item.setCheckable(True)
             root_item.setCheckState(Qt.CheckState.Unchecked)
         self.tree_model.invisibleRootItem().appendRow(root_item)
-        self._build_tree_recursive(root_item, "", mode)
+        self._populate_tree_children(root_item, "", mode)
         self.tree_view.expand(self.tree_model.indexFromItem(root_item))
         self.tree_model.blockSignals(False)
         self.progress_bar.hide()
         self.status_bar.showMessage(f"Loaded: {os.path.basename(self.zip_path)}")
 
-    def _build_tree_recursive(self, parent_item, parent_path, mode):
+    def _populate_tree_children(self, parent_item, parent_path, mode):
+        """Add immediate folder children of parent_path to parent_item.
+        Each child that itself has children gets a placeholder so the tree
+        shows an expand arrow; actual grandchildren are loaded on demand."""
         children = sorted(self.folder_map.get(parent_path, []))
         for p in children:
-            if p in self.folder_map:
-                if mode == CLEAN_MODE and self.is_path_hidden(p): continue
-                name = p.split('/')[-1]
-                item = QStandardItem(self._display_name(name))
-                item.setData(p, Qt.ItemDataRole.UserRole)
-                item.setEditable(False)
-                if mode == EDIT_FILTER_MODE:
-                    item.setCheckable(True)
-                    if self.is_path_hidden(p):
-                        item.setCheckState(Qt.CheckState.Unchecked)
-                        item.setForeground(QColor("#cc2222"))  # red text = excluded
-                    else:
-                        item.setCheckState(Qt.CheckState.Checked)
-                elif mode in (0, CLEAN_MODE):
-                    item.setCheckable(True)
+            if p not in self.folder_map:
+                continue
+            if mode == CLEAN_MODE and self.is_path_hidden(p):
+                continue
+            name = p.split('/')[-1]
+            item = QStandardItem(self._display_name(name))
+            item.setData(p, Qt.ItemDataRole.UserRole)
+            item.setEditable(False)
+            if mode == EDIT_FILTER_MODE:
+                item.setCheckable(True)
+                if self.is_path_hidden(p):
                     item.setCheckState(Qt.CheckState.Unchecked)
-                parent_item.appendRow(item)
-                self._build_tree_recursive(item, p, mode)
+                    item.setForeground(QColor("#cc2222"))
+                else:
+                    item.setCheckState(Qt.CheckState.Checked)
+            elif mode in (0, CLEAN_MODE):
+                item.setCheckable(True)
+                item.setCheckState(Qt.CheckState.Unchecked)
+            parent_item.appendRow(item)
+            # Add a placeholder so Qt shows the expand arrow without
+            # loading all grandchildren upfront.
+            if self.folder_map.get(p):
+                placeholder = QStandardItem()
+                placeholder.setData(_TREE_PLACEHOLDER, Qt.ItemDataRole.UserRole)
+                placeholder.setEditable(False)
+                item.appendRow(placeholder)
 
     def is_path_hidden(self, path):
         for rule in self.hidden_paths:
             if path.startswith(rule): return True
         return False
 
+    def _on_tree_item_expanded(self, index):
+        """Lazy-load children when a tree node is expanded for the first time."""
+        item = self.tree_model.itemFromIndex(index)
+        if item is None or item.rowCount() != 1:
+            return
+        placeholder = item.child(0)
+        if placeholder is None or placeholder.data(Qt.ItemDataRole.UserRole) != _TREE_PLACEHOLDER:
+            return
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if path is None:
+            return
+        mode = self.view_group.checkedId()
+        self._tree_populating = True
+        item.removeRow(0)
+        self._populate_tree_children(item, path, mode)
+        self._tree_populating = False
+
+    def _ensure_children_loaded(self, item):
+        """If item still holds only a placeholder, replace it with real children."""
+        if item.rowCount() == 1:
+            placeholder = item.child(0)
+            if placeholder and placeholder.data(Qt.ItemDataRole.UserRole) == _TREE_PLACEHOLDER:
+                path = item.data(Qt.ItemDataRole.UserRole)
+                if path is not None:
+                    mode = self.view_group.checkedId()
+                    self._tree_populating = True
+                    item.removeRow(0)
+                    self._populate_tree_children(item, path, mode)
+                    self._tree_populating = False
+
+    def _ensure_all_descendants_loaded(self, item):
+        """Recursively force-load every level under item (used for recursive tick)."""
+        self._ensure_children_loaded(item)
+        for row in range(item.rowCount()):
+            child = item.child(row)
+            if child is not None:
+                self._ensure_all_descendants_loaded(child)
+
     def on_tree_item_changed(self, item):
+        if self._tree_populating:
+            return
         mode = self.view_group.checkedId()
         if mode == EDIT_FILTER_MODE:
             path = item.data(Qt.ItemDataRole.UserRole)
@@ -1807,10 +2057,7 @@ class FastZipBrowser(QMainWindow):
         if idx.isValid():
             self.on_folder_selected(idx)
         else:
-            empty_model = QStandardItemModel()
-            empty_model.setHorizontalHeaderLabels(self.file_headers)
-            self.file_model = empty_model
-            self.proxy_model.setSourceModel(self.file_model)
+            self._set_file_model(FileTableModel(self.file_headers))
             self._update_filter_columns(self.file_headers)
             self._refresh_table_status()
 
