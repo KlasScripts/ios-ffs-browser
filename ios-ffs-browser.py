@@ -399,28 +399,34 @@ class ZipMetadataWorker(QThread):
                     prefix = _detect_cellebrite_prefix(zip_names)
                     path_resolver = _make_cellebrite_path(prefix)
 
-            self.status_update.emit("Generating tree...")
+            self.status_update.emit(f"Building folder tree ({len(raw_data):,} entries)...")
             ui_metadata = {}
-            folder_map = {}
+            # Use sets for O(1) child-membership checks during orphan reconnection.
+            folder_map_sets: dict[str, set] = {}
 
             for ui_path, meta in raw_data.items():
                 ui_metadata[ui_path] = meta
                 parent_path = ui_path.rsplit('/', 1)[0] if '/' in ui_path else ""
-                folder_map.setdefault(parent_path, []).append(ui_path)
+                folder_map_sets.setdefault(parent_path, set()).add(ui_path)
 
             # Reconnect orphaned directories whose intermediate parents have no
-            # explicit zip entry (common in Graykey archives)
-            for path in list(folder_map.keys()):
+            # explicit zip entry (common in Graykey archives).
+            # Using set membership keeps this O(n·depth) instead of O(n²).
+            self.status_update.emit("Resolving folder hierarchy...")
+            for path in list(folder_map_sets.keys()):
                 current = path
                 while current:
                     parent = current.rsplit('/', 1)[0] if '/' in current else ""
-                    if parent not in folder_map:
-                        folder_map[parent] = [current]
-                    elif current not in folder_map[parent]:
-                        folder_map[parent].append(current)
+                    if parent not in folder_map_sets:
+                        folder_map_sets[parent] = {current}
+                    elif current not in folder_map_sets[parent]:   # O(1) set check
+                        folder_map_sets[parent].add(current)
                     else:
                         break
                     current = parent
+
+            # Convert sets → lists now that all mutations are done.
+            folder_map = {k: list(v) for k, v in folder_map_sets.items()}
 
             # Find UUID-shaped container folders (in the three known locations)
             # that have no bundle ID mapping — their metadata.plist is absent
@@ -1000,6 +1006,12 @@ class FastZipBrowser(QMainWindow):
         else:
             self._log(f"Filter cleared in: {self._view_path}")
 
+    def _get_zip_handle(self) -> zipfile.ZipFile:
+        """Return the shared ZipFile handle, opening it lazily on first use."""
+        if self._zip_handle is None:
+            self._zip_handle = zipfile.ZipFile(self.zip_path, 'r')
+        return self._zip_handle
+
     def _in_zip(self, ui_path) -> bool:
         return self._path_resolver(ui_path) in self.zip_names
 
@@ -1156,7 +1168,7 @@ class FastZipBrowser(QMainWindow):
 
         try:
             data_offset, file_size = _stored_entry_offset(
-                self.zip_path, physical_path, self._zip_handle)
+                self.zip_path, physical_path, self._get_zip_handle())
         except Exception as e:
             self._on_hex_error(str(e))
             return
@@ -1847,7 +1859,7 @@ class FastZipBrowser(QMainWindow):
         self._real_content_cache = {}
         if self._zip_handle:
             self._zip_handle.close()
-        self._zip_handle = zipfile.ZipFile(self.zip_path, 'r')
+            self._zip_handle = None   # opened lazily on first hex-preview request
         self.progress_bar.setRange(0, 100)
         self.reload_tree_entirely()
         if missing_plist_paths:

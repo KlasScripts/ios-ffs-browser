@@ -120,15 +120,17 @@ def _parse_entry(f: zipfile.ZipInfo) -> dict:
     inode = int.from_bytes(in_block[:8], 'little') if in_block is not None else 0
 
     # Graykey block: version(1B) flags(1B) [prot_class(4B)] [xattrs]
-    gk    = _find_gk_block(extra)
-    gver, gflag = gk[0], gk[1]
-
-    if gver != 1:
-        raise ValueError(f'Unsupported Graykey version {gver} in {f.filename!r}')
-
-    off = 2  # past version + flags bytes within gk data
-    if gflag & 1:
-        off += 4  # skip data protection class
+    gk = _find_gk_block(extra)
+    xattrs = {}
+    if gk is not None and len(gk) >= 2:
+        gver, gflag = gk[0], gk[1]
+        if gver != 1:
+            raise ValueError(f'Unsupported Graykey version {gver} in {f.filename!r}')
+        off = 2  # past version + flags bytes within gk data
+        if gflag & 1:
+            off += 4  # skip data protection class
+        if gflag & 2:
+            xattrs = _parse_xattrs(gk, off)
 
     return {
         'atime': atime * _S_TO_NS,
@@ -142,7 +144,7 @@ def _parse_entry(f: zipfile.ZipInfo) -> dict:
         'mode':  None,
         'prot':  None,
         'size':  f.file_size,
-        'xattr': _parse_xattrs(gk, off) if gflag & 2 else {},
+        'xattr': xattrs,
     }
 
 
