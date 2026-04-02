@@ -13,6 +13,8 @@ a = Analysis(
     datas=[
         # Bundle the forensic settings JSON next to the exe
         ('forensic_settings.json', '.'),
+        # Bundle the icons so resource_path() can find them at runtime
+        ('resources', 'resources'),
     ],
     hiddenimports=[
         # msgpack sometimes needs explicit nudging
@@ -57,7 +59,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # icon='icon.ico',              # uncomment and add an .ico file if you have one
+    icon='resources/icon.ico' if sys.platform == 'win32' else 'resources/icon.icns',
 )
 
 coll = COLLECT(

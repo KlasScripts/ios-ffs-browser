@@ -17,7 +17,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView,
                               QRadioButton, QButtonGroup, QComboBox, QSplitter, QStatusBar,
                               QLineEdit, QLabel, QPlainTextEdit, QFrame, QTextEdit)
 from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QFont,
-                           QCursor, QColor, QTextCharFormat, QTextCursor, QFontMetricsF)
+                           QCursor, QColor, QTextCharFormat, QTextCursor, QFontMetricsF,
+                           QIcon)
 from PySide6.QtCore import Qt, QThread, Signal, QSortFilterProxyModel, QTimer, QEvent, QModelIndex, QAbstractTableModel
 
 SETTINGS_FILE = "forensic_settings.json"
@@ -743,6 +744,7 @@ class FastZipBrowser(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("iOS FFS Browser")
+        self.setWindowIcon(QIcon(resource_path(os.path.join("resources", "icon.png"))))
         self.resize(1350, 850)
 
         self.zip_path = ""
@@ -920,7 +922,8 @@ class FastZipBrowser(QMainWindow):
         _hex_font.setStyleHint(QFont.StyleHint.Monospace)
         self.hex_view.setFont(_hex_font)
         self.hex_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        self.hex_view.setStyleSheet("QPlainTextEdit { padding: 4px 8px; }")
+        self.hex_view.setStyleSheet("")
+        self.hex_view.document().setDocumentMargin(10)
         self.hex_view.setPlaceholderText("Double-click a file to preview it here, or right-click and choose 'Preview in Hex Viewer'.")
         self.hex_view.selectionChanged.connect(self._on_hex_selection_changed)
         self.hex_view.viewport().installEventFilter(self)
@@ -1302,29 +1305,48 @@ class FastZipBrowser(QMainWindow):
         return super().eventFilter(obj, event)
 
     def _fit_hex_font(self):
+        """Compute and apply the largest font size that fits a full hex line.
+        Always defers one event-loop tick so the viewport has settled after
+        setPlainText / resize before we measure."""
+        QTimer.singleShot(0, self._do_fit_hex_font)
+
+    # A representative worst-case hex line — all bytes 0xff, full 32-byte row.
+    # Used as the measurement string for font fitting so we measure actual
+    # rendered characters rather than the widest possible glyph ('W').
+    # ── Change _HEX_REF_SIZE to adjust the hex viewer font size ──────────────
+    _HEX_REF_SIZE = 15.0   # reference point size; scale up/down to taste
+
+    # Full 32-byte hex line at worst-case values — used for measurement.
+    _HEX_SAMPLE_LINE = (
+        "ffffffff  "
+        "ff ff ff ff  ff ff ff ff  ff ff ff ff  ff ff ff ff  "
+        "ff ff ff ff  ff ff ff ff  ff ff ff ff  ff ff ff ff  "
+        "................................"
+    )
+
+    def _do_fit_hex_font(self):
         if self._fitting_hex_font:
             return
         vp_width = self.hex_view.viewport().width()
         if vp_width <= 0:
             return
-        font = self.hex_view.font()
-        fm = QFontMetricsF(font)
-        # Measure the full line as a string — more accurate than single-char × count
-        line_chars = _HEX_ASCII_START + _HEX_BYTES_PER_ROW  # 146
-        line_width = fm.horizontalAdvance('W' * line_chars)
-        if line_width <= 0:
-            return
-        # Subtract the document's own left+right margin from available width
-        doc_margin = self.hex_view.document().documentMargin()
-        usable = vp_width - 2 * doc_margin - 2  # 2px safety against sub-pixel rounding
-        new_size = font.pointSizeF() * (usable / line_width) * 0.95
-        new_size = max(6.0, min(new_size, 32.0))
-        if abs(new_size - font.pointSizeF()) < 0.1:
-            return
         self._fitting_hex_font = True
         try:
-            font.setPointSizeF(new_size)
-            self.hex_view.setFont(font)
+            # Measure the text width directly with QFontMetricsF at the
+            # reference size — synchronous, no layout pass required.
+            # Then add the document's left+right margins to get total content width.
+            ref_font = QFont("Menlo", self._HEX_REF_SIZE)
+            ref_font.setStyleHint(QFont.StyleHint.Monospace)
+            fm = QFontMetricsF(ref_font)
+            text_width = fm.horizontalAdvance(self._HEX_SAMPLE_LINE)
+            if text_width <= 0:
+                return
+            doc_margin = self.hex_view.document().documentMargin()
+            content_width = text_width + 2 * doc_margin
+            new_size = self._HEX_REF_SIZE * (vp_width / content_width)
+            new_size = max(6.0, min(new_size, 32.0))
+            ref_font.setPointSizeF(new_size)
+            self.hex_view.setFont(ref_font)
         finally:
             self._fitting_hex_font = False
 
@@ -2124,6 +2146,7 @@ class FastZipBrowser(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(resource_path(os.path.join("resources", "icon.png"))))
     window = FastZipBrowser()
     window.show()
     sys.exit(app.exec())
