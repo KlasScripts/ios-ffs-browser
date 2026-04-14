@@ -9,6 +9,8 @@ import json
 import subprocess
 import plistlib
 import pathlib
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from adapters import FfsAdapter
 from zip_entry import ZipEntry
@@ -22,13 +24,15 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView,
                               QTabWidget, QScrollArea, QGridLayout, QSizePolicy)
 from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QFont,
                            QCursor, QColor, QTextCharFormat, QTextCursor, QFontMetricsF,
-                           QIcon, QPixmap, QImage)
+                           QIcon, QPixmap, QImage, QFontDatabase)
 from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer, QEvent,
                              QModelIndex, QAbstractTableModel, QBuffer, QIODevice)
 
-SETTINGS_FILE = "forensic_settings.json"
-RECENT_FILE   = "recent_archives.json"
-DEVICE_LABELS_FILE = "device_labels.json"
+SETTINGS_FILE        = "forensic_settings.json"
+RECENT_FILE          = "recent_archives.json"
+DEVICE_LABELS_FILE   = "device_labels.json"
+RECENT_SEARCHES_FILE = "recent_searches.json"
+CASE_LOCATIONS_FILE  = "case_locations.json"
 HARDWARE_MODELS_FILE = "hardware_models.json"
 NEW_ARCHIVE_SENTINEL = "<Open New FFS...>"   # kept for back-compat with saved data; no longer shown in dropdown
 
@@ -657,19 +661,49 @@ def _thumb_cache_path() -> str:
     return os.path.join(d, 'thumbcache.db')
 
 
-def _open_thumb_db() -> sqlite3.Connection:
-    """Open (or create) the thumbnail cache DB with WAL mode for safe access."""
-    conn = sqlite3.connect(_thumb_cache_path(), timeout=5)
+def _open_case_db(cache_dir: str | None = None) -> sqlite3.Connection:
+    """Open (or create) the per-case database with WAL mode for safe access.
+
+    Tables:
+      thumbnails    — cached media thumbnails
+      search_results — saved keyword search hits
+    """
+    if cache_dir is not None:
+        os.makedirs(cache_dir, exist_ok=True)
+        db_path = os.path.join(cache_dir, 'casedata.db')
+    else:
+        # Fallback: shared location when no case dir is configured
+        base = os.environ.get('LOCALAPPDATA', os.path.expanduser('~')) \
+               if sys.platform == 'win32' \
+               else os.environ.get('XDG_CACHE_HOME',
+                                   os.path.join(os.path.expanduser('~'), '.cache'))
+        d = os.path.join(base, 'ios-ffs-browser')
+        os.makedirs(d, exist_ok=True)
+        db_path = os.path.join(d, 'casedata.db')
+    conn = sqlite3.connect(db_path, timeout=5)
     conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('''
         CREATE TABLE IF NOT EXISTS thumbnails (
-            zip_path  TEXT    NOT NULL,
-            ui_path   TEXT    NOT NULL,
-            file_size INTEGER NOT NULL,
+            zip_path   TEXT    NOT NULL,
+            ui_path    TEXT    NOT NULL,
+            file_size  INTEGER NOT NULL,
             thumb_size INTEGER NOT NULL,
-            data      BLOB    NOT NULL,
+            data       BLOB    NOT NULL,
             PRIMARY KEY (zip_path, ui_path, file_size, thumb_size)
         )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS search_results (
+            zip_path  TEXT    NOT NULL,
+            keyword   TEXT    NOT NULL,
+            filename  TEXT    NOT NULL,
+            offset    INTEGER NOT NULL,
+            context   TEXT    NOT NULL
+        )
+    ''')
+    conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_search_results
+        ON search_results (zip_path, keyword)
     ''')
     conn.commit()
     return conn
@@ -691,7 +725,7 @@ class ThumbnailWorker(QThread):
     finished_all    = Signal()
 
     def __init__(self, zip_path, items, path_resolver, thumb_size, zip_info_map,
-                 streaming_index=None):
+                 streaming_index=None, cache_dir=None):
         super().__init__()
         self.zip_path        = zip_path
         self.items           = items
@@ -699,6 +733,7 @@ class ThumbnailWorker(QThread):
         self.thumb_size      = thumb_size
         self.zip_info_map    = zip_info_map
         self.streaming_index = streaming_index
+        self.cache_dir       = cache_dir
         self._stop           = False
 
     def stop(self):
@@ -714,16 +749,24 @@ class ThumbnailWorker(QThread):
         return data
 
     def run(self):
-        db = _open_thumb_db()
+        db = _open_case_db(self.cache_dir)
         try:
-            # ── 1. Bulk-load the entire cache for this archive in one query ────
+            # ── 1. Bulk-load only the thumbnails needed for the current item set ──
+            # Using IN (...) rather than loading the full archive avoids pulling
+            # thousands of BLOB rows into memory when only a folder subset is shown.
+            # SQLite IN() limit is 999, so chunk large sets.
             cached = {}
-            for r in db.execute(
-                'SELECT ui_path, file_size, data FROM thumbnails '
-                'WHERE zip_path=? AND thumb_size=?',
-                (self.zip_path, self.thumb_size)
-            ):
-                cached[(r[0], r[1])] = r[2]
+            _CHUNK = 900
+            items_list = list(self.items)
+            for i in range(0, len(items_list), _CHUNK):
+                chunk = items_list[i:i + _CHUNK]
+                placeholders = ','.join('?' * len(chunk))
+                for r in db.execute(
+                    f'SELECT ui_path, file_size, data FROM thumbnails '
+                    f'WHERE zip_path=? AND thumb_size=? AND ui_path IN ({placeholders})',
+                    (self.zip_path, self.thumb_size, *chunk)
+                ):
+                    cached[(r[0], r[1])] = r[2]
 
             pending = []
 
@@ -1121,6 +1164,327 @@ class ClickableThumb(QWidget):
             self.setStyleSheet("ClickableThumb { background-color: transparent; }")
 
 
+class KeywordSearchWorker(QThread):
+    """Search all STORED entries in a zip for a keyword using multiple threads.
+
+    Emits:
+        result_found(filename, offset_in_file, context_str)
+        progress(files_done, files_total)
+        finished(total_hits)
+    """
+
+    result_found  = Signal(str, int, str)   # name, offset-in-file, context
+    progress      = Signal(int, int)        # done, total
+    finished      = Signal(int)             # total hits
+    status_update = Signal(str)             # free-text status line
+
+    _CHUNK      = 1 * 1024 * 1024   # 1 MB read chunks
+    _CTX_BYTES  = 40                # bytes either side of hit for context
+
+    def __init__(self, zip_path: str, keyword: str,
+                 streaming_index=None, parent=None):
+        super().__init__(parent)
+        self.zip_path         = zip_path
+        self.keyword          = keyword.encode('utf-8', errors='replace')
+        self.streaming_index  = streaming_index  # None for normal zip
+        self._stop            = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def _build_entries(self) -> list:
+        """Build (name, data_offset, file_size) list inside the worker thread
+        so local-header seeks never block the GUI."""
+        entries = []
+        if self.streaming_index is not None:
+            for name in self.streaming_index.namelist():
+                try:
+                    entry = self.streaming_index.get_entry(name)
+                    if entry.is_stored and entry.file_size > 0:
+                        entries.append((name, entry.data_offset, entry.file_size))
+                except Exception:
+                    pass
+        else:
+            try:
+                with zipfile.ZipFile(self.zip_path, 'r') as z:
+                    for zinfo in z.infolist():
+                        if self._stop.is_set():
+                            return entries
+                        if zinfo.compress_type == zipfile.ZIP_STORED and zinfo.file_size > 0:
+                            e = ZipEntry(self.zip_path, zinfo.filename, zinfo)
+                            entries.append((zinfo.filename, e.data_offset, zinfo.file_size))
+            except Exception:
+                pass
+        return entries
+
+    def run(self):
+        self.status_update.emit("Preparing search index…")
+        entries   = self._build_entries()
+        self.status_update.emit(f"Index ready — {len(entries):,} files to search")
+        kw        = self.keyword
+        kw_len    = len(kw)
+        total     = len(entries)
+        hits      = 0
+        done      = 0
+        n_threads = min(8, os.cpu_count() or 4)
+
+        def search_entry(_name, data_offset, file_size):
+            if self._stop.is_set():
+                return []
+            results = []
+            overlap = kw_len - 1
+            chunk   = self._CHUNK
+            pos     = 0
+            try:
+                with open(self.zip_path, 'rb') as fh:
+                    fh.seek(data_offset)
+                    buf_start = 0
+                    leftover  = b''
+                    while pos < file_size and not self._stop.is_set():
+                        read_len = min(chunk, file_size - pos)
+                        raw      = fh.read(read_len)
+                        if not raw:
+                            break
+                        block      = leftover + raw
+                        block_base = buf_start
+                        idx        = 0
+                        while True:
+                            idx = block.find(kw, idx)
+                            if idx == -1:
+                                break
+                            file_offset = block_base + idx
+                            ctx_start   = max(0, idx - self._CTX_BYTES)
+                            ctx_end     = min(len(block), idx + kw_len + self._CTX_BYTES)
+                            ctx_bytes   = block[ctx_start:ctx_end]
+                            before      = ctx_bytes[:idx - ctx_start]
+                            after       = ctx_bytes[idx - ctx_start + kw_len:]
+                            hit_text    = kw.decode('utf-8', errors='replace')
+                            context     = (
+                                before.decode('utf-8', errors='replace')
+                                + f'[{hit_text}]'
+                                + after.decode('utf-8', errors='replace')
+                            )
+                            results.append((file_offset, context))
+                            idx += kw_len
+                        leftover  = block[-overlap:] if overlap > 0 else b''
+                        buf_start = block_base + len(block) - len(leftover)
+                        pos      += read_len
+            except OSError:
+                pass
+            return results
+
+        with ThreadPoolExecutor(max_workers=n_threads) as pool:
+            futures = {
+                pool.submit(search_entry, name, off, size): name
+                for name, off, size in entries
+            }
+            for fut in as_completed(futures):
+                if self._stop.is_set():
+                    break
+                name = futures[fut]
+                done += 1
+                self.progress.emit(done, total)
+                try:
+                    for file_offset, context in fut.result():
+                        hits += 1
+                        self.result_found.emit(name, file_offset, context)
+                except Exception:
+                    pass
+
+        self.finished.emit(hits)
+
+
+class CaseSettingsDialog(QDialog):
+    """Shown the first time an FFS zip is opened.
+
+    Lets the user choose the base folder that will hold the per-zip case folder.
+    The case folder is created as  <base>/<zip_stem>/  and stores:
+      • casedata.db    — thumbnails and search results
+      • Export/        — extracted files
+    """
+
+    def __init__(self, zip_path: str, last_base: str | None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Case Folder Settings")
+        self.setModal(True)
+        self.setMinimumWidth(560)
+
+        self._zip_stem = pathlib.Path(zip_path).stem
+        self._accepted_dir: str | None = None
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        layout.addWidget(QLabel(
+            "<b>Choose where to store the cache and exports for this FFS archive.</b><br>"
+            "A folder named after the zip will be created inside the location you select."
+        ))
+
+        # Base folder row
+        base_row = QHBoxLayout()
+        base_row.addWidget(QLabel("Base folder:"))
+        self._base_edit = QLineEdit()
+        self._base_edit.setPlaceholderText("Select a folder…")
+        if last_base and os.path.isdir(last_base):
+            self._base_edit.setText(last_base)
+        self._base_edit.textChanged.connect(self._update_preview)
+        base_row.addWidget(self._base_edit, 1)
+        browse_btn = QPushButton("Browse…")
+        browse_btn.setFixedWidth(80)
+        browse_btn.clicked.connect(self._browse)
+        base_row.addWidget(browse_btn)
+        layout.addLayout(base_row)
+
+        # Preview
+        self._preview_label = QLabel()
+        self._preview_label.setWordWrap(True)
+        layout.addWidget(self._preview_label)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self._save_btn = QPushButton("Save Settings")
+        self._save_btn.setDefault(True)
+        self._save_btn.clicked.connect(self._on_save)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(self._save_btn)
+        layout.addLayout(btn_row)
+
+        # Populate preview now that _save_btn exists
+        self._update_preview()
+
+    def _browse(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Base Folder",
+                                                  self._base_edit.text())
+        if folder:
+            self._base_edit.setText(folder)
+
+    def _update_preview(self):
+        base = self._base_edit.text().strip()
+        if not base:
+            self._preview_label.setText("<i>No folder selected.</i>")
+            self._save_btn.setEnabled(False)
+            return
+        case_dir  = os.path.join(base, self._zip_stem)
+        cache_loc = os.path.join(case_dir, 'casedata.db')
+        export_loc = os.path.join(case_dir, 'Export', '')
+        self._preview_label.setText(
+            f"<b>Case folder:</b> {case_dir}<br>"
+            f"<b>Thumbnail cache:</b> {cache_loc}<br>"
+            f"<b>Export folder:</b> {export_loc}"
+        )
+        self._save_btn.setEnabled(True)
+
+    def _on_save(self):
+        base = self._base_edit.text().strip()
+        if not base:
+            return
+        self._accepted_dir = os.path.join(base, self._zip_stem)
+        self.accept()
+
+    @property
+    def case_dir(self) -> str | None:
+        return self._accepted_dir
+
+
+class SearchProgressDialog(QDialog):
+    """Modal progress dialog shown during a keyword search.
+
+    Displays a scrolling log of status messages followed by live
+    progress counters.  The Cancel button stops the worker but leaves
+    any hits already found intact so the user can review them.
+    """
+
+    cancelled = Signal()
+
+    def __init__(self, term: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Keyword Search")
+        self.setModal(True)
+        self.setMinimumWidth(480)
+        self.setMinimumHeight(260)
+        self._interrupted = False
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        layout.addWidget(QLabel(f"<b>Searching for:</b> {term}"))
+
+        self._log = QPlainTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setFixedHeight(100)
+        self._log.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        layout.addWidget(self._log)
+
+        self._progress_label = QLabel("Starting…")
+        layout.addWidget(self._progress_label)
+
+        self._bar = QProgressBar()
+        self._bar.setRange(0, 0)   # indeterminate until we know total
+        layout.addWidget(self._bar)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.clicked.connect(self._on_cancel)
+        btn_row.addWidget(self._cancel_btn)
+        layout.addLayout(btn_row)
+
+    # ── Slots called by the worker signals ────────────────────────────────────
+
+    def append_status(self, text: str):
+        self._log.appendPlainText(text)
+        self._log.verticalScrollBar().setValue(
+            self._log.verticalScrollBar().maximum())
+
+    def update_progress(self, done: int, total: int, hits: int):
+        if self._bar.maximum() != total:
+            self._bar.setRange(0, total)
+        self._bar.setValue(done)
+        self._progress_label.setText(
+            f"Checked {done:,} / {total:,} files  |  "
+            f"hits in {hits:,} file{'s' if hits != 1 else ''} so far")
+
+    def mark_finished(self, n_files: int, total_hits: int):
+        self._bar.setValue(self._bar.maximum())
+        self._progress_label.setText(
+            f"Complete — {total_hits:,} hit{'s' if total_hits != 1 else ''} "
+            f"across {n_files:,} file{'s' if n_files != 1 else ''}")
+        self._cancel_btn.setText("Close")
+
+    def mark_interrupted(self, n_files: int):
+        self._interrupted = True
+        self._progress_label.setText(
+            f"Partial search — interrupted  "
+            f"({n_files:,} file{'s' if n_files != 1 else ''} with hits)")
+        self._cancel_btn.setText("Close")
+
+    @property
+    def was_interrupted(self) -> bool:
+        return self._interrupted
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _on_cancel(self):
+        if self._cancel_btn.text() == "Close":
+            self.accept()
+        else:
+            self.cancelled.emit()
+            # Button text changes to "Close" once the worker finishes and
+            # mark_interrupted() is called; don't close yet so the user
+            # can read the final status.
+
+    def closeEvent(self, event):
+        """Block the window-close button while searching is in progress."""
+        if self._cancel_btn.text() not in ("Close",):
+            self.cancelled.emit()
+            event.ignore()
+        else:
+            super().closeEvent(event)
+
+
 class FastZipBrowser(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1141,6 +1505,8 @@ class FastZipBrowser(QMainWindow):
         self.hidden_paths = self.load_settings()
         self.recent_paths = self.load_recent_list()
         self.device_labels: dict = _load_json_file(DEVICE_LABELS_FILE, {})
+        self._case_locations: dict = _load_json_file(CASE_LOCATIONS_FILE, {})
+        self._case_dir: str | None = None   # case folder for the currently loaded zip
 
         # ── Menu bar ──────────────────────────────────────────────────────
         menu_bar = self.menuBar()
@@ -1355,10 +1721,73 @@ class FastZipBrowser(QMainWindow):
         media_tab_layout.addWidget(self._media_status)
         media_tab_layout.addWidget(media_scroll, stretch=1)
 
+        # ── Keyword search tab ───────────────────────────────────────────────
+        search_tab = QWidget()
+        search_tab_layout = QVBoxLayout(search_tab)
+        search_tab_layout.setContentsMargins(4, 4, 4, 4)
+        search_tab_layout.setSpacing(4)
+
+        # Controls row
+        search_ctrl = QHBoxLayout()
+        self.search_recent_combo = QComboBox()
+        self.search_recent_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.search_recent_combo.setMinimumContentsLength(20)
+        self.search_recent_combo.setMaximumWidth(260)
+        self.search_recent_combo.setToolTip("Recent searches")
+        self.search_field = QLineEdit()
+        self.search_field.setPlaceholderText("Enter keyword…")
+        self.search_field.returnPressed.connect(self._start_keyword_search)
+        self.search_btn  = QPushButton("Search")
+        self.search_btn.setFixedWidth(80)
+        self.search_btn.clicked.connect(self._start_keyword_search)
+        self.search_stop_btn = QPushButton("Stop")
+        self.search_stop_btn.setFixedWidth(60)
+        self.search_stop_btn.setEnabled(False)
+        self.search_stop_btn.clicked.connect(self._stop_keyword_search)
+        self.search_status = QLabel("No search running")
+        search_ctrl.addWidget(QLabel("Recent:"))
+        search_ctrl.addWidget(self.search_recent_combo)
+        search_ctrl.addSpacing(8)
+        search_ctrl.addWidget(QLabel("Search:"))
+        search_ctrl.addWidget(self.search_field, 1)
+        search_ctrl.addWidget(self.search_btn)
+        search_ctrl.addWidget(self.search_stop_btn)
+        search_tab_layout.addLayout(search_ctrl)
+        search_tab_layout.addWidget(self.search_status)
+
+        # Results tree: Name | Hits | Context | Offset
+        self.search_results_model = QStandardItemModel()
+        self.search_results_model.setHorizontalHeaderLabels(
+            ["Name", "Hits", "Context", "Offset"])
+        self.search_results_view = QTreeView()
+        self.search_results_view.setModel(self.search_results_model)
+        self.search_results_view.setEditTriggers(QTreeView.EditTrigger.NoEditTriggers)
+        self.search_results_view.setSelectionBehavior(QTreeView.SelectionBehavior.SelectRows)
+        self.search_results_view.setAlternatingRowColors(True)
+        self.search_results_view.setUniformRowHeights(True)
+        self.search_results_view.header().setStretchLastSection(False)
+        self.search_results_view.header().resizeSection(0, 220)
+        self.search_results_view.header().resizeSection(1, 50)
+        self.search_results_view.header().resizeSection(2, 260)
+        self.search_results_view.header().resizeSection(3, 90)
+        self.search_results_view.selectionModel().selectionChanged.connect(
+            self._on_search_row_selected)
+        search_tab_layout.addWidget(self.search_results_view, stretch=1)
+
+        self._search_worker: KeywordSearchWorker | None = None
+        self._search_progress_dlg: SearchProgressDialog | None = None
+        # Node lookup dicts for building the tree during a live search
+        self._search_folder_items: dict[str, QStandardItem] = {}
+        self._search_file_items:   dict[str, QStandardItem] = {}
+        self._recent_searches: list = _load_json_file(RECENT_SEARCHES_FILE, [])
+        self._refresh_search_recent_combo()
+        self.search_recent_combo.activated.connect(self._on_search_recent_selected)
+
         # ── Tab widget ──────────────────────────────────────────────────────
         self.center_tabs = QTabWidget()
         self.center_tabs.addTab(file_tab, "File Browser")
         self.center_tabs.addTab(media_tab, "Media Browser")
+        self.center_tabs.addTab(search_tab, "Keyword Search")
         self.center_tabs.currentChanged.connect(self._on_center_tab_changed)
 
         right_panel = QWidget()
@@ -1528,6 +1957,9 @@ class FastZipBrowser(QMainWindow):
     # ── Media browser ────────────────────────────────────────────────────────
 
     def _on_center_tab_changed(self, index):
+        if index == 2:
+            self._update_search_status_bar()
+            return
         if index == 1:
             # Determine pending selection from the file browser
             if self._selected_file_path and \
@@ -1662,7 +2094,7 @@ class FastZipBrowser(QMainWindow):
 
         self._thumb_worker = ThumbnailWorker(
             self.zip_path, media_paths, self._adapter.resolve, THUMB_SIZE, zip_info_map,
-            streaming_index=self._streaming_index)
+            streaming_index=self._streaming_index, cache_dir=self._case_dir)
         self._thumb_worker.thumbnail_ready.connect(self._on_thumbnail_ready)
         self._thumb_worker.finished_all.connect(self._on_thumbnails_done)
         self._thumb_worker.start()
@@ -1711,8 +2143,31 @@ class FastZipBrowser(QMainWindow):
         return p.parent, p.stem
 
     def _get_export_dir(self):
+        if self._case_dir:
+            return os.path.join(self._case_dir, 'Export')
         parent, stem = self._zip_stem()
         return str(parent / f"{stem}_Export")
+
+    def _get_or_ask_case_dir(self, zip_path: str) -> str | None:
+        """Return the case dir for *zip_path*, asking the user if not yet set."""
+        if zip_path in self._case_locations:
+            return self._case_locations[zip_path]
+        # Determine default base from last used case dir
+        last_base = None
+        if self._case_locations:
+            last_case = next(reversed(self._case_locations.values()))
+            last_base = os.path.dirname(last_case)
+        dlg = CaseSettingsDialog(zip_path, last_base, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        case_dir = dlg.case_dir
+        self._case_locations[zip_path] = case_dir
+        try:
+            with open(CASE_LOCATIONS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self._case_locations, f, indent=2)
+        except OSError:
+            pass
+        return case_dir
 
     def _get_log_path(self):
         parent, stem = self._zip_stem()
@@ -2491,6 +2946,10 @@ class FastZipBrowser(QMainWindow):
             self.start_loading(path)
 
     def start_loading(self, zip_path):
+        case_dir = self._get_or_ask_case_dir(zip_path)
+        if case_dir is None:
+            return   # user cancelled the dialog
+        self._case_dir = case_dir
         self.zip_path = zip_path
         self._log(f"SESSION START — Archive loaded: {zip_path}")
         self._reset_tree_model()
@@ -2882,6 +3341,288 @@ class FastZipBrowser(QMainWindow):
         with open(RECENT_FILE, 'w', encoding='utf-8') as f:
             json.dump(self.recent_paths, f)
         self.update_dropdown_ui()
+
+    # ── Keyword search ────────────────────────────────────────────────────────
+
+    def _refresh_search_recent_combo(self):
+        self.search_recent_combo.blockSignals(True)
+        self.search_recent_combo.clear()
+        self.search_recent_combo.addItem("Recent searches…")
+        model = self.search_recent_combo.model()
+        item  = model.item(0)
+        from PySide6.QtCore import Qt as _Qt
+        item.setFlags(item.flags() & ~(_Qt.ItemFlag.ItemIsSelectable | _Qt.ItemFlag.ItemIsEnabled))
+        for term in self._recent_searches:
+            self.search_recent_combo.addItem(term)
+        self.search_recent_combo.blockSignals(False)
+
+    def _on_search_row_selected(self):
+        indexes = self.search_results_view.selectionModel().selectedRows(0)
+        if not indexes:
+            return
+        item = self.search_results_model.itemFromIndex(indexes[0])
+        if not item:
+            return
+        _PATH_ROLE   = Qt.ItemDataRole.UserRole
+        _OFFSET_ROLE = Qt.ItemDataRole.UserRole + 1
+        depth = 0
+        node = item
+        while node.parent():
+            depth += 1
+            node = node.parent()
+        path   = item.data(_PATH_ROLE) or ''
+        offset = item.data(_OFFSET_ROLE)
+        if depth == 0:
+            # Folder node
+            self.status_bar.showMessage(path)
+        elif depth == 1:
+            # File node
+            self.status_bar.showMessage(path)
+        else:
+            # Hit node — show file path + offset
+            msg = path
+            if offset is not None:
+                msg += f'  —  offset: {offset:,}'
+            self.status_bar.showMessage(msg)
+
+    def _search_add_hit(self, filename: str, offset: int, context: str):
+        """Insert one hit into the tree, creating folder/file nodes as needed.
+        GUID path segments are replaced with bundle IDs for display.
+        Full paths are stored as Qt.UserRole data on folder/file/hit items
+        so the status bar can show them without a visible column."""
+        _PATH_ROLE = Qt.ItemDataRole.UserRole
+
+        folder   = filename.rsplit('/', 1)[0] if '/' in filename else ''
+        basename = filename.rsplit('/', 1)[-1]
+        display_folder   = self._display_path(folder)
+        display_basename = self._display_name(basename)
+        folder_short     = display_folder.rsplit('/', 1)[-1] if '/' in display_folder else display_folder
+        full_folder_path = display_folder + '/'
+        full_file_path   = (display_folder + '/' + display_basename) if display_folder else display_basename
+
+        # ── Folder node ───────────────────────────────────────────────────────
+        if folder not in self._search_folder_items:
+            folder_item = QStandardItem(f'📁  {folder_short}/')
+            folder_item.setEditable(False)
+            folder_item.setData(full_folder_path, _PATH_ROLE)
+            hits_item = QStandardItem('1')
+            hits_item.setEditable(False)
+            blank = lambda: QStandardItem('')
+            row = [folder_item, hits_item, blank(), blank()]
+            for cell in row:
+                cell.setEditable(False)
+            self.search_results_model.invisibleRootItem().appendRow(row)
+            self._search_folder_items[folder] = folder_item
+        else:
+            folder_item = self._search_folder_items[folder]
+            hits_cell = self.search_results_model.item(folder_item.row(), 1)
+            if hits_cell:
+                hits_cell.setText(str(int(hits_cell.text()) + 1))
+
+        # ── File node ─────────────────────────────────────────────────────────
+        if filename not in self._search_file_items:
+            file_item = QStandardItem(f'📄  {display_basename}')
+            file_item.setEditable(False)
+            file_item.setData(full_file_path, _PATH_ROLE)
+            file_hits = QStandardItem('1')
+            file_hits.setEditable(False)
+            row = [file_item, file_hits, QStandardItem(''), QStandardItem('')]
+            for cell in row:
+                cell.setEditable(False)
+            folder_item.appendRow(row)
+            self._search_file_items[filename] = file_item
+        else:
+            file_item = self._search_file_items[filename]
+            file_hits_cell = folder_item.child(file_item.row(), 1)
+            if file_hits_cell:
+                file_hits_cell.setText(str(int(file_hits_cell.text()) + 1))
+
+        # ── Hit node  (cols: Name | Hits | Context | Offset) ─────────────────
+        hit_item = QStandardItem('')
+        hit_item.setData(full_file_path, _PATH_ROLE)   # path stored for status bar
+        hit_item.setData(offset, Qt.ItemDataRole.UserRole + 1)  # offset stored separately
+        hit_row = [hit_item, QStandardItem(''), QStandardItem(context), QStandardItem(str(offset))]
+        for cell in hit_row:
+            cell.setEditable(False)
+        file_item.appendRow(hit_row)
+
+    def _update_search_status_bar(self):
+        """Sync the status bar to the current search state."""
+        if self.center_tabs.currentIndex() != 2:
+            return
+        term = self.search_field.text().strip()
+        if not term:
+            self.status_bar.showMessage("Keyword Search")
+            return
+        n_files = len(self._search_file_items)
+        if self._search_worker and self._search_worker.isRunning():
+            self.status_bar.showMessage(
+                f"Searching: '{term}'  |  hits in {n_files:,} file{'s' if n_files != 1 else ''} so far")
+        else:
+            if n_files:
+                self.status_bar.showMessage(
+                    f"Search: '{term}'  |  hits in {n_files:,} file{'s' if n_files != 1 else ''}")
+            else:
+                self.status_bar.showMessage(f"Search: '{term}'  |  No results")
+
+    def _on_search_recent_selected(self, index):
+        if index == 0:
+            return
+        term = self.search_recent_combo.itemText(index)
+        self.search_field.setText(term)
+        # Load from DB if cached, otherwise run a fresh search
+        if self._load_search_from_db(term):
+            self._update_search_status_bar()
+            return
+        self._start_keyword_search()
+
+    def _save_recent_search(self, term: str):
+        if term in self._recent_searches:
+            self._recent_searches.remove(term)
+        self._recent_searches.insert(0, term)
+        self._recent_searches = self._recent_searches[:20]
+        try:
+            with open(RECENT_SEARCHES_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self._recent_searches, f)
+        except OSError:
+            pass
+        self._refresh_search_recent_combo()
+
+    def _open_case_db_conn(self) -> sqlite3.Connection | None:
+        """Open casedata.db for the current archive, or None if not available."""
+        if not self._case_dir:
+            return None
+        try:
+            return _open_case_db(self._case_dir)
+        except OSError:
+            return None
+
+    def _load_search_from_db(self, term: str) -> bool:
+        """Populate the results table from the DB for *term*.
+        Returns True if cached results were found, False otherwise."""
+        db = self._open_case_db_conn()
+        if db is None:
+            return False
+        try:
+            rows = db.execute(
+                'SELECT filename, offset, context FROM search_results '
+                'WHERE zip_path=? AND keyword=? ORDER BY rowid',
+                (self.zip_path, term)
+            ).fetchall()
+        finally:
+            db.close()
+        if not rows:
+            return False
+        self.search_results_model.clear()
+        self.search_results_model.setHorizontalHeaderLabels(
+            ["Name", "Hits", "Context", "Offset"])
+        self._search_folder_items.clear()
+        self._search_file_items.clear()
+        for filename, offset, context in rows:
+            self._search_add_hit(filename, offset, context)
+        total = len(rows)
+        self.search_status.setText(
+            f"'{term}' — {total:,} hit{'s' if total != 1 else ''} (loaded from cache)")
+        return True
+
+    def _start_keyword_search(self):
+        term = self.search_field.text().strip()
+        if not term or not self.zip_path:
+            return
+        self._stop_keyword_search()
+        self.search_results_model.clear()
+        self.search_results_model.setHorizontalHeaderLabels(
+            ["Name", "Hits", "Context", "Offset"])
+        self._search_folder_items.clear()
+        self._search_file_items.clear()
+        self._save_recent_search(term)
+        # Clear any stale cached results for this term so they get re-saved fresh
+        db = self._open_case_db_conn()
+        if db:
+            try:
+                db.execute('DELETE FROM search_results WHERE zip_path=? AND keyword=?',
+                           (self.zip_path, term))
+                db.commit()
+            finally:
+                db.close()
+        self.search_status.setText(f"Building file index for '{term}'…")
+        self.search_btn.setEnabled(False)
+        self.search_stop_btn.setEnabled(True)
+
+        # Create and show the modal progress dialog
+        self._search_progress_dlg = SearchProgressDialog(term, parent=self)
+        self._search_progress_dlg.cancelled.connect(self._cancel_keyword_search)
+
+        self._search_worker = KeywordSearchWorker(
+            self.zip_path, term,
+            streaming_index=self._streaming_index)
+        self._search_worker.status_update.connect(self._search_progress_dlg.append_status)
+        self._search_worker.result_found.connect(self._on_search_result)
+        self._search_worker.progress.connect(self._on_search_progress)
+        self._search_worker.finished.connect(self._on_search_finished)
+        self._search_worker.start()
+
+        self._search_progress_dlg.exec()   # blocks until dialog is closed
+
+    def _cancel_keyword_search(self):
+        """Stop the running worker; keep existing hits for review."""
+        if self._search_worker and self._search_worker.isRunning():
+            self._search_worker.stop()
+            # Don't wait here — _on_search_finished will fire and close the dialog
+
+    def _stop_keyword_search(self):
+        if self._search_worker and self._search_worker.isRunning():
+            self._search_worker.stop()
+            self._search_worker.wait()
+        self.search_btn.setEnabled(True)
+        self.search_stop_btn.setEnabled(False)
+
+    def _on_search_result(self, name: str, offset: int, context: str):
+        self._search_add_hit(name, offset, context)
+        # Persist hit to DB
+        db = self._open_case_db_conn()
+        if db:
+            try:
+                term = self.search_field.text().strip()
+                db.execute(
+                    'INSERT INTO search_results (zip_path, keyword, filename, offset, context) '
+                    'VALUES (?,?,?,?,?)',
+                    (self.zip_path, term, name, offset, context)
+                )
+                db.commit()
+            finally:
+                db.close()
+
+    def _on_search_progress(self, done: int, total: int):
+        hits = len(self._search_file_items)
+        self.search_status.setText(
+            f"Searching… {done:,}/{total:,} files  |  hits in {hits:,} file{'s' if hits != 1 else ''} so far")
+        self._update_search_status_bar()
+        if self._search_progress_dlg:
+            self._search_progress_dlg.update_progress(done, total, hits)
+
+    def _on_search_finished(self, total_hits: int):
+        self.search_btn.setEnabled(True)
+        self.search_stop_btn.setEnabled(False)
+        term    = self.search_field.text().strip()
+        n_files = len(self._search_file_items)
+        dlg = self._search_progress_dlg
+        if dlg:
+            if dlg.was_interrupted:
+                dlg.mark_interrupted(n_files)
+                self.search_status.setText(
+                    f"'{term}' — partial search, interrupted  "
+                    f"({n_files:,} file{'s' if n_files != 1 else ''} with hits)")
+            else:
+                dlg.mark_finished(n_files, total_hits)
+                self.search_status.setText(
+                    f"'{term}' — hits in {n_files:,} file{'s' if n_files != 1 else ''} across archive")
+        else:
+            self.search_status.setText(
+                f"'{term}' — hits in {n_files:,} file{'s' if n_files != 1 else ''} across archive")
+        self._update_search_status_bar()
+        for col in range(self.search_results_model.columnCount()):
+            self.search_results_view.resizeColumnToContents(col)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
