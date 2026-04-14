@@ -21,17 +21,17 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QTableView,
                               QFileDialog, QProgressBar, QMenu, QDialog,
                               QRadioButton, QButtonGroup, QComboBox, QSplitter, QStatusBar,
                               QLineEdit, QLabel, QPlainTextEdit, QFrame, QTextEdit,
-                              QTabWidget, QScrollArea, QGridLayout, QSizePolicy)
+                              QTabWidget, QScrollArea, QGridLayout, QSizePolicy,
+                              QStyledItemDelegate, QStyle)
 from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QFont,
                            QCursor, QColor, QTextCharFormat, QTextCursor, QFontMetricsF,
-                           QIcon, QPixmap, QImage, QFontDatabase)
+                           QIcon, QPixmap, QImage, QFontDatabase, QTextDocument)
 from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer, QEvent,
                              QModelIndex, QAbstractTableModel, QBuffer, QIODevice)
 
 SETTINGS_FILE        = "forensic_settings.json"
 RECENT_FILE          = "recent_archives.json"
 DEVICE_LABELS_FILE   = "device_labels.json"
-RECENT_SEARCHES_FILE = "recent_searches.json"
 CASE_LOCATIONS_FILE  = "case_locations.json"
 HARDWARE_MODELS_FILE = "hardware_models.json"
 NEW_ARCHIVE_SENTINEL = "<Open New FFS...>"   # kept for back-compat with saved data; no longer shown in dropdown
@@ -704,6 +704,13 @@ def _open_case_db(cache_dir: str | None = None) -> sqlite3.Connection:
     conn.execute('''
         CREATE INDEX IF NOT EXISTS idx_search_results
         ON search_results (zip_path, keyword)
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS recent_searches (
+            term       TEXT    NOT NULL,
+            used_at    INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+            PRIMARY KEY (term)
+        )
     ''')
     conn.commit()
     return conn
@@ -1389,6 +1396,70 @@ class CaseSettingsDialog(QDialog):
         return self._accepted_dir
 
 
+class SearchContextDelegate(QStyledItemDelegate):
+    """Renders the Context column (col 2) with the search term highlighted."""
+
+    CONTEXT_COL = 2
+    _HL_BG  = "#ffeb3b"   # highlight background (yellow)
+    _HL_FG  = "#000000"   # highlight foreground
+
+    def __init__(self, get_term, parent=None):
+        super().__init__(parent)
+        self._get_term = get_term   # callable → current search term string
+
+    def paint(self, painter, option, index):
+        if index.column() != self.CONTEXT_COL:
+            super().paint(painter, option, index)
+            return
+
+        text = index.data(Qt.ItemDataRole.DisplayRole) or ''
+        term = self._get_term()
+        if not term or not text:
+            super().paint(painter, option, index)
+            return
+
+        self.initStyleOption(option, index)
+
+        # Draw the item background / selection highlight (no text yet)
+        style = option.widget.style() if option.widget else QApplication.style()
+        option.text = ''
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, option, painter, option.widget)
+
+        # Build HTML: escape both, then re-insert highlighted spans
+        import html as _html, re as _re
+        escaped = _html.escape(text)
+        pattern = _re.compile(_re.escape(_html.escape(term)), _re.IGNORECASE)
+        highlighted = pattern.sub(
+            lambda m: (f'<span style="background:{self._HL_BG};color:{self._HL_FG};">'
+                       f'{m.group()}</span>'),
+            escaped
+        )
+
+        # Choose foreground colour based on selection state
+        if option.state & QStyle.StateFlag.State_Selected:
+            fg = option.palette.highlightedText().color().name()
+        else:
+            fg = option.palette.text().color().name()
+
+        doc = QTextDocument()
+        doc.setDefaultStyleSheet(f'body {{ color: {fg}; }}')
+        doc.setHtml(f'<body>{highlighted}</body>')
+        doc.setTextWidth(option.rect.width())
+
+        text_rect = style.subElementRect(
+            QStyle.SubElement.SE_ItemViewItemText, option, option.widget)
+
+        painter.save()
+        painter.translate(text_rect.topLeft())
+        painter.setClipRect(text_rect.translated(-text_rect.topLeft()))
+        doc.drawContents(painter)
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        sh = super().sizeHint(option, index)
+        return sh
+
+
 class SearchProgressDialog(QDialog):
     """Modal progress dialog shown during a keyword search.
 
@@ -1772,6 +1843,10 @@ class FastZipBrowser(QMainWindow):
         self.search_results_view.header().resizeSection(3, 90)
         self.search_results_view.selectionModel().selectionChanged.connect(
             self._on_search_row_selected)
+        self._search_context_delegate = SearchContextDelegate(
+            lambda: self.search_field.text().strip())
+        self.search_results_view.setItemDelegate(self._search_context_delegate)
+        self.search_results_view.expanded.connect(self._on_search_tree_expanded)
         search_tab_layout.addWidget(self.search_results_view, stretch=1)
 
         self._search_worker: KeywordSearchWorker | None = None
@@ -1779,7 +1854,7 @@ class FastZipBrowser(QMainWindow):
         # Node lookup dicts for building the tree during a live search
         self._search_folder_items: dict[str, QStandardItem] = {}
         self._search_file_items:   dict[str, QStandardItem] = {}
-        self._recent_searches: list = _load_json_file(RECENT_SEARCHES_FILE, [])
+        self._recent_searches: list = []   # populated from casedata.db when a case is loaded
         self._refresh_search_recent_combo()
         self.search_recent_combo.activated.connect(self._on_search_recent_selected)
 
@@ -2951,6 +3026,7 @@ class FastZipBrowser(QMainWindow):
             return   # user cancelled the dialog
         self._case_dir = case_dir
         self.zip_path = zip_path
+        self._load_recent_searches_from_db()
         self._log(f"SESSION START — Archive loaded: {zip_path}")
         self._reset_tree_model()
         self.tree_view.setModel(self.tree_model)
@@ -3446,6 +3522,11 @@ class FastZipBrowser(QMainWindow):
             cell.setEditable(False)
         file_item.appendRow(hit_row)
 
+    def _on_search_tree_expanded(self):
+        """Resize all columns to content whenever a node is expanded."""
+        for col in range(self.search_results_model.columnCount()):
+            self.search_results_view.resizeColumnToContents(col)
+
     def _update_search_status_bar(self):
         """Sync the status bar to the current search state."""
         if self.center_tabs.currentIndex() != 2:
@@ -3477,15 +3558,36 @@ class FastZipBrowser(QMainWindow):
         self._start_keyword_search()
 
     def _save_recent_search(self, term: str):
-        if term in self._recent_searches:
-            self._recent_searches.remove(term)
-        self._recent_searches.insert(0, term)
-        self._recent_searches = self._recent_searches[:20]
-        try:
-            with open(RECENT_SEARCHES_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self._recent_searches, f)
-        except OSError:
-            pass
+        db = self._open_case_db_conn()
+        if db:
+            try:
+                db.execute(
+                    'INSERT INTO recent_searches (term, used_at) VALUES (?, strftime(\'%s\',\'now\'))'
+                    ' ON CONFLICT(term) DO UPDATE SET used_at=excluded.used_at',
+                    (term,)
+                )
+                db.commit()
+                rows = db.execute(
+                    'SELECT term FROM recent_searches ORDER BY used_at DESC LIMIT 20'
+                ).fetchall()
+                self._recent_searches = [r[0] for r in rows]
+            finally:
+                db.close()
+        self._refresh_search_recent_combo()
+
+    def _load_recent_searches_from_db(self):
+        """Reload the recent-searches list from the current case DB."""
+        db = self._open_case_db_conn()
+        if db:
+            try:
+                rows = db.execute(
+                    'SELECT term FROM recent_searches ORDER BY used_at DESC LIMIT 20'
+                ).fetchall()
+                self._recent_searches = [r[0] for r in rows]
+            finally:
+                db.close()
+        else:
+            self._recent_searches = []
         self._refresh_search_recent_combo()
 
     def _open_case_db_conn(self) -> sqlite3.Connection | None:
