@@ -31,7 +31,6 @@ from PySide6.QtCore import (Qt, QThread, Signal, QSortFilterProxyModel, QTimer, 
 
 SETTINGS_FILE        = "forensic_settings.json"
 FFS_ARCHIVES_FILE    = "ffs_archives.json"
-DEVICE_LABELS_FILE   = "device_labels.json"
 HARDWARE_MODELS_FILE = "hardware_models.json"
 NEW_ARCHIVE_SENTINEL = "<Open New FFS...>"   # kept for back-compat with saved data; no longer shown in dropdown
 
@@ -280,9 +279,15 @@ def _plist_find(d, key, _depth=0):
     return None
 
 
-def _read_device_info(zip_path: str) -> str:
-    """Return a short label like 'Apple iPhone 14 Pro · iOS 17.4.1' extracted
-    from the FFS zip, or '' if the info cannot be determined."""
+def _read_device_info(zip_path: str) -> dict:
+    """Return structured device info extracted from the FFS zip.
+
+    Keys: make, model, ios_version, hw_id, label
+    All values are strings; label is a short display string like
+    'Apple iPhone 14 Pro · iOS 17.4.1' suitable for the dropdown.
+    Returns a dict with all empty strings on failure.
+    """
+    empty = {'make': '', 'model': '', 'ios_version': '', 'hw_id': '', 'label': ''}
     try:
         with zipfile.ZipFile(zip_path, 'r') as z:
             adapter = FfsAdapter.detect(z)
@@ -312,25 +317,33 @@ def _read_device_info(zip_path: str) -> str:
             if not hw_id:
                 hw_id = _plist_find(mg_plist, 'HardwareModel') or ''
 
+            make = ''
+            model = ''
             if not hw_id:
-                model_name = ''
+                pass
             elif hw_id in _HW_BOARD_NAMES:
                 entry = _HW_BOARD_NAMES[hw_id]
-                model_name = f"{entry[0]} {entry[1]}"
+                make, model = entry[0], entry[1]
             elif hw_id in _HW_MODEL_NAMES:
-                model_name = _HW_MODEL_NAMES[hw_id]
+                make = 'Apple'
+                model = _HW_MODEL_NAMES[hw_id]
             else:
-                model_name = hw_id
+                model = hw_id
 
+            model_name = f'{make} {model}'.strip() if (make or model) else ''
             if model_name and ios_version:
-                return f'{model_name} · iOS {ios_version}'
-            if ios_version:
-                return f'iOS {ios_version}'
-            if model_name:
-                return model_name
-            return ''
+                label = f'{model_name} · iOS {ios_version}'
+            elif ios_version:
+                label = f'iOS {ios_version}'
+            elif model_name:
+                label = model_name
+            else:
+                label = ''
+
+            return {'make': make, 'model': model, 'ios_version': ios_version,
+                    'hw_id': hw_id, 'label': label}
     except Exception:
-        return ''
+        return empty
 
 
 class ExtractorWorker(QThread):
@@ -705,6 +718,15 @@ def _open_case_db(cache_dir: str | None = None) -> sqlite3.Connection:
     conn.execute('''
         CREATE INDEX IF NOT EXISTS idx_search_results
         ON search_results (zip_path, keyword)
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS device_info (
+            zip_path    TEXT PRIMARY KEY,
+            make        TEXT NOT NULL DEFAULT '',
+            model       TEXT NOT NULL DEFAULT '',
+            ios_version TEXT NOT NULL DEFAULT '',
+            hw_id       TEXT NOT NULL DEFAULT ''
+        )
     ''')
     conn.execute('''
         CREATE TABLE IF NOT EXISTS recent_searches (
@@ -1623,10 +1645,10 @@ class FastZipBrowser(QMainWindow):
         self._hex_worker: QThread | None = None
         self._adapter = FfsAdapter(FfsAdapter.FORMAT_CELLEBRITE, "filesystem2", "filesystem1")
         self.hidden_paths = self.load_settings()
-        # ffs_archives: ordered list of {"path": ..., "case_dir": ...}, most-recent first
+        # ffs_archives: ordered list of {"path": ..., "case_dir": ..., "label": ...}, most-recent first
         self._ffs_archives: list = _load_json_file(FFS_ARCHIVES_FILE, [])
         self.recent_paths: list = [e['path'] for e in self._ffs_archives if 'path' in e]
-        self.device_labels: dict = _load_json_file(DEVICE_LABELS_FILE, {})
+        self._migrate_device_labels()
         self._case_dir: str | None = None   # case folder for the currently loaded zip
 
         # ── Menu bar ──────────────────────────────────────────────────────
@@ -3180,7 +3202,8 @@ class FastZipBrowser(QMainWindow):
         self.tree_model.setHorizontalHeaderLabels([f"Folder Structure — {fmt_label}"])
         # Fetch device label after the archive is fully processed, so the
         # dropdown shows only the filepath until loading is complete.
-        if self.zip_path not in self.device_labels:
+        _entry = self._archive_entry(self.zip_path)
+        if not (_entry and _entry.get('label')):
             QTimer.singleShot(0, lambda: self._fetch_and_store_label(self.zip_path))
         if missing_plist_paths:
             # Only warn about UUID folders that actually have content in the zip.
@@ -3447,6 +3470,30 @@ class FastZipBrowser(QMainWindow):
 
     # ── ffs_archives helpers ──────────────────────────────────────────────────
 
+    def _migrate_device_labels(self):
+        """One-time migration: copy labels from the old device_labels.json into
+        ffs_archives entries, then delete the file."""
+        old_file = 'device_labels.json'
+        if not os.path.exists(old_file):
+            return
+        try:
+            with open(old_file, 'r', encoding='utf-8') as f:
+                old_labels: dict = json.load(f)
+        except Exception:
+            return
+        changed = False
+        for entry in self._ffs_archives:
+            p = entry.get('path', '')
+            if p and not entry.get('label') and p in old_labels:
+                entry['label'] = old_labels[p]
+                changed = True
+        if changed:
+            self._save_ffs_archives()
+        try:
+            os.remove(old_file)
+        except OSError:
+            pass
+
     def _archive_entry(self, path: str) -> dict | None:
         """Return the archive entry for *path*, or None if not present."""
         for e in self._ffs_archives:
@@ -3464,11 +3511,15 @@ class FastZipBrowser(QMainWindow):
 
     def _upsert_archive(self, path: str, case_dir: str | None = None):
         """Move *path* to front of _ffs_archives (max 5), optionally setting case_dir."""
-        # Remove existing entry for this path
+        # Preserve any existing label when reinserting
+        existing = self._archive_entry(path)
+        existing_label = existing.get('label', '') if existing else ''
         self._ffs_archives = [e for e in self._ffs_archives if e.get('path') != path]
         entry: dict = {'path': path}
         if case_dir is not None:
             entry['case_dir'] = case_dir
+        if existing_label:
+            entry['label'] = existing_label
         self._ffs_archives.insert(0, entry)
         self._ffs_archives = self._ffs_archives[:5]
         self.recent_paths = [e['path'] for e in self._ffs_archives]
@@ -3486,13 +3537,24 @@ class FastZipBrowser(QMainWindow):
         self.update_dropdown_ui()
 
     def _fetch_and_store_label(self, path):
-        label = _read_device_info(path)
-        self.device_labels[path] = label
+        info = _read_device_info(path)
+        # Write structured device info to casedata.db
         try:
-            with open(DEVICE_LABELS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.device_labels, f)
-        except OSError:
+            db = _open_case_db(self._case_dir)
+            db.execute(
+                'INSERT OR REPLACE INTO device_info (zip_path, make, model, ios_version, hw_id) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (path, info['make'], info['model'], info['ios_version'], info['hw_id'])
+            )
+            db.commit()
+            db.close()
+        except Exception:
             pass
+        # Store label in ffs_archives entry for easy dropdown population
+        entry = self._archive_entry(path)
+        if entry is not None:
+            entry['label'] = info['label']
+            self._save_ffs_archives()
         self.update_dropdown_ui()
 
     def update_dropdown_ui(self):
@@ -3505,7 +3567,8 @@ class FastZipBrowser(QMainWindow):
         from PySide6.QtCore import Qt as _Qt
         item.setFlags(item.flags() & ~(_Qt.ItemFlag.ItemIsSelectable | _Qt.ItemFlag.ItemIsEnabled))
         for p in self.recent_paths:
-            label = self.device_labels.get(p, '')
+            entry = self._archive_entry(p)
+            label = entry.get('label', '') if entry else ''
             display = f'{label}  —  {p}' if label else p
             self.archive_dropdown.addItem(display, userData=p)
         self.archive_dropdown.setCurrentIndex(0)
@@ -3525,7 +3588,8 @@ class FastZipBrowser(QMainWindow):
             self._recent_menu.addAction(empty_act)
             return
         for p in self.recent_paths:
-            label = self.device_labels.get(p, '')
+            entry = self._archive_entry(p)
+            label = entry.get('label', '') if entry else ''
             display = f'{label}  —  {p}' if label else p
             act = QAction(display, self)
             act.triggered.connect(lambda _checked, path=p: self.start_loading(path))
